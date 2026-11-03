@@ -308,3 +308,20 @@ Pendiente:
 - Medir en el decoder si la imagen cambia algo frente a la referencia (solo hay oráculo de la torre).
 - Mantener cargada la visión entre imágenes (hoy se carga y descarga por turno salvo con
   `HELIOS_VISION_MMAP=1`).
+
+## 16. Gemma 4 densa: E4B (2026-11-03)
+
+`hnf10 convert --model gemma-4-E4B-it/ --out salida.v10.hnf --vision` reconoce que no es MoE y usa
+la conversión densa (`src/gemma4_dense.rs`). Su único perfil por ahora, el compacto, pone en HQ8K
+toda matriz con columnas múltiplo de 256: atención, MLP, embedding, la tabla PLE (262144 × 10752)
+y sus proyecciones. Las normas y los escalares van en FP16. HQ8K sustituye al HQ62K con el que se
+convertía el E4B en el v9.1. La torre visual va en el mismo paso (`vision::Tower`, la misma pieza
+que `add-vision`). Sus clamps aprendidos son escalares y se guardan como `[1]`, porque HNFv10 no
+admite rango 0. El audio todavía no se convierte: el motor no tiene adaptador de audio para el E4B.
+
+- Checkpoint `google/gemma-4-E4B-it`, revisión `ee0ef6023621cff504d758262d4e04895a5af4a2`.
+- 51 segundos de conversión. 719 tensores de texto (8,0 GB) y 659 de visión (339 MB).
+- En Héctor, en una sola GPU y sin reparto: carga en 7 s, decodifica a unos 70 tok/s y describe
+  imágenes.
+- Frente a transformers en CPU (BF16), en 16 posiciones de 4 documentos del conjunto de
+  evaluación: **KL media 0,0017** (máxima 0,0063) y el mismo argmax en las 16.

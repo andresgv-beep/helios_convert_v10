@@ -31,10 +31,13 @@ enum Command {
     Info { file: PathBuf },
     /// Verificación profunda: el hash de cada tensor y de cada payload.
     Verify { file: PathBuf },
-    /// Convierte un checkpoint Gemma 4 MoE de safetensors a HNFv10.
+    /// Convierte un checkpoint Gemma 4 de safetensors a HNFv10: el MoE (26B) o uno denso (E2B,
+    /// E4B), según su config.json.
     Convert {
         #[arg(long)] model: PathBuf,
         #[arg(long)] out: PathBuf,
+        /// Denso: añade la torre visual en el mismo fichero, como componente opcional.
+        #[arg(long)] vision: bool,
         /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
         #[arg(long)] dense_hq8: bool,
         /// Importancia HQ44 por experto (layerN.gate_up.f32 y layerN.down.f32).
@@ -101,8 +104,17 @@ fn main() -> Result<()> {
                 println!("  paso {} «{}» {} {} params, {} tensores tocados", s.kind, s.tool, s.version, s.params.len(), s.touched.len());
             }
         }
-        Command::Convert { model, out, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
+            if config["text_config"]["enable_moe_block"] != true {
+                anyhow::ensure!(!dense_hq8 && importance.is_none(), "--dense-hq8 e --importance son del MoE; el denso ya va en HQ8K");
+                let identity = helios_convert_v10::gemma4_dense::convert(&helios_convert_v10::gemma4_dense::Options {
+                    model: &model, out: &out, vision, commit: &commit })?;
+                println!("listo: {}, identidad {}", out.display(), hex(&identity));
+                return Ok(());
+            }
+            anyhow::ensure!(!vision, "en el MoE la visión se añade después con add-vision");
             let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {
                 model: &model, out: &out, dense, importance: importance.as_deref(), commit: &commit, batch_rows: 128 })?;
