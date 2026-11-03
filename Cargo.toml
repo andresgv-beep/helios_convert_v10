@@ -1,0 +1,14 @@
+[package]
+name = "helios-convert-v10"
+version = "0.1.0"
+edition = "2021"
+description = "HELIOS Native Format v10 container: writer, reader, seal and migration from HNFv9"
+authors = ["Andrés García <andres@helios.ai>"]
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crc32fast = "1.3"
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"] }
+
+[dev-dependencies]
