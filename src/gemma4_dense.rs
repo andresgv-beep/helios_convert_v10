@@ -1,8 +1,9 @@
 //! Conversión directa de Gemma 4 densa (E2B, E4B) de safetensors a HNFv10.
 //!
-//! Perfil único por ahora, el compacto: toda matriz con columnas múltiplo de 256 (atención, MLP,
-//! embedding, PLE y sus proyecciones) en HQ8K, y normas y escalares en FP16. HQ8K sustituye a
-//! HQ62K, descartado el 2026-11-02 (docs/HQS_FORMATOS.md). Con `vision`, la torre va en el mismo
+//! Dos perfiles. `Q8`: toda matriz con columnas múltiplo de 256 (atención, MLP, embedding, PLE y
+//! sus proyecciones) en HQ8K, para GPUs con VRAM de sobra; HQ8K sustituye a HQ62K, descartado el
+//! 2026-11-02 (docs/HQS_FORMATOS.md). `Compacto`: además, MLP y tabla PLE en HQ44, las dos piezas
+//! grandes; atención y embedding siguen en HQ8K, como en el 26B. Normas y escalares, en FP16. Con `vision`, la torre va en el mismo
 //! fichero como componente VISION opcional (vision.rs). Cada tensor de texto va alineado a 4 KiB
 //! y su xxh3-128 se calcula mientras se escribe, como en la conversión del MoE.
 use crate::file::{open, verify_tensors, Builder};
@@ -18,9 +19,13 @@ use half::{bf16, f16};
 use std::io::Write;
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile { Q8, Compacto }
+
 pub struct Options<'a> {
     pub model: &'a Path,
     pub out: &'a Path,
+    pub profile: Profile,
     pub vision: bool,
     pub commit: &'a str,
 }
@@ -39,13 +44,23 @@ fn source_f32(raw: &[u8], dtype: &str, i: usize) -> f32 {
     }
 }
 
-/// HQ8K si la matriz admite superbloques de 256 por fila; si no, FP16. Las normas, escalares
-/// y demás tensores que el mapper pide en FP16 se quedan en FP16, salvo el embedding, que en
-/// el perfil compacto va en HQ8K como en el 26B.
-fn storage(canonical: &str, hint: QuantHint, shape: &[usize]) -> &'static str {
+/// Cuantizada si la matriz admite superbloques de 256 por fila; si no, FP16. Las normas,
+/// escalares y demás tensores que el mapper pide en FP16 se quedan en FP16, salvo el embedding,
+/// que va en HQ8K como en el 26B. En el compacto, MLP y tabla PLE van en HQ44.
+fn storage(profile: Profile, canonical: &str, hint: QuantHint, shape: &[usize]) -> &'static str {
     let matrix = shape.len() >= 2 && shape.last().map_or(false, |&c| c % 256 == 0);
     let embedding = canonical == "text.token_embedding.weight";
-    if matrix && (hint != QuantHint::FP16 || embedding) { "hq8k" } else { "fp16" }
+    if !matrix || (hint == QuantHint::FP16 && !embedding) { return "fp16"; }
+    let large = canonical.contains(".mlp.") || canonical == "text.ple.token_embedding.weight";
+    if profile == Profile::Compacto && large { crate::hqs::v4::DTYPE } else { "hq8k" }
+}
+
+fn stored_bytes(dtype: &str, elements: u64) -> u64 {
+    match dtype {
+        "hq8k" => crate::hqs::hq8k_size(elements as usize) as u64,
+        "hq44k_g16" => elements / 256 * 152,
+        _ => elements * 2,
+    }
 }
 
 fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<()> {
@@ -60,6 +75,9 @@ fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<()> {
         ensure!(values.iter().all(|v| v.is_finite()), "{}: valores no finitos", t.canonical);
         if t.dtype == "hq8k" {
             w.write_all(&crate::hqs::quantize_hq8k(&values))?;
+        } else if t.dtype == crate::hqs::v4::DTYPE {
+            // Sin calibrar: importancia 1 en todas las columnas.
+            w.write_all(&crate::hqs::v4::quantize(&values, row, &[])?)?;
         } else {
             let mut bytes = Vec::with_capacity(values.len() * 2);
             for v in values {
@@ -95,9 +113,9 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         let Some(m) = mapper.map_tensor(name) else { continue };
         ensure!(["BF16", "F16", "F32"].contains(&info.dtype.as_str()), "{name}: dtype {} no admitido", info.dtype);
         let canonical = format!("text.{}", m.canonical_name);
-        let dtype = storage(&canonical, m.quant_hint, &info.shape);
+        let dtype = storage(o.profile, &canonical, m.quant_hint, &info.shape);
         let elements: u64 = info.shape.iter().map(|&d| d as u64).product();
-        let bytes = if dtype == "hq8k" { crate::hqs::hq8k_size(elements as usize) as u64 } else { elements * 2 };
+        let bytes = stored_bytes(dtype, elements);
         plan.push(Planned { canonical, source: name.to_string(), layer: m.layer_idx.map_or(-1, |l| l as i32),
             shape: info.shape.clone(), dtype, bytes });
     }
@@ -175,7 +193,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     for i in 0..md.components.len() { md.components[i].composite = md.composite(&md.components[i]); }
 
     let mut params = vec![
-        Property { key: "profile".into(), value: Value::Str("hq8k".into()) },
+        Property { key: "profile".into(), value: Value::Str(match o.profile { Profile::Q8 => "q8", Profile::Compacto => "compacto" }.into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
         Property { key: "calibration".into(), value: Value::Str("none".into()) },
