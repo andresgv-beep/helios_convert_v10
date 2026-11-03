@@ -132,6 +132,7 @@ La capa y el componente son campos: nadie los deduce del nombre.
 | xxh3-128 de metadatos | toda la región de metadatos | siempre |
 | Compuesto por componente | xxh3-128 de la concatenación, en orden, de (offset, tamaño, hash de bytes) de cada tensor | siempre: sale de los metadatos |
 | Hash de bytes por tensor | sus bytes | bajo demanda (`--verify`), y siempre en las herramientas que los modifican |
+| Hash de bytes de un recurso | tokenizer, configuración, plantilla | siempre, al abrir (pocos MB); desde la auditoría del 2026-11-03 |
 | Identidad del fichero | xxh3-128 de (hash de metadatos sin la procedencia, compuestos de todos los componentes) | entrada y salida de cada paso de procedencia |
 
 La identidad excluye la procedencia: añadir un paso de sellado no cambia qué es el modelo.
@@ -297,6 +298,13 @@ Con `append_vision` sale el mismo TNIH que construyéndolo de una vez con texto 
 - **Reparto:** el motor guarda en la GPU 1 el sitio que pide la visión (pesos más fórmula en el
   máximo) antes de colocar capas de texto: quedan 18 capas en la 4070 Ti y 12 en la 2080 Ti. La
   torre corre en la 2080 Ti y el prefill de la imagen cruza las dos GPUs.
+- **Colocación (auditoría de GPT, 2026-11-03):** el motor decide con `gemma4_placement` y tres
+  estados explícitos: entra en la principal, se reparte (con `boundary` 0 válido: todas las capas
+  en la secundaria) o no cabe, con error antes de cargar nada. La torre va a la principal si cabe
+  junto al texto. Si no, va a la secundaria repartiendo el texto; si el texto cabría solo, la
+  última capa cruza para que el reparto no quede vacío. Si la torre no cabe en ningún sitio, el
+  modelo abre solo con texto y no anuncia visión. El E4B, en la 4070 Ti, va entero con su torre;
+  el 26B sigue repartido 17+13 con la torre en la 2080 Ti.
 - **Texto sin cambios:** en el conjunto final de 40 documentos, el HNF con visión da con 20 capas
   en la 4070 Ti la misma KL que el refinado sin visión, documento a documento (0,5404). Con el
   reparto de HEXOS (18 + 12) da 0,5405 / 0,5795 / argmax 0,793, que es ruido de pasar una capa más

@@ -58,6 +58,10 @@ fn round_trip_and_tensor_hashes() {
     f.write_all_at(&[0xEE], md.tensors[1].offset + 10).unwrap();
     assert!(open(&path).is_ok());
     assert_eq!(verify_tensors(&path, &md).unwrap(), vec![md.tensors[1].name.clone()]);
+    // Un byte cambiado en un recurso (la configuración) lo rechaza ya la apertura.
+    f.write_all_at(&[0xEE], md.components[1].payload_offset + 3).unwrap();
+    let error = open(&path).err().expect("un recurso dañado debe rechazarse");
+    assert!(error.to_string().contains("no cuadra con su hash"));
 }
 
 #[test]

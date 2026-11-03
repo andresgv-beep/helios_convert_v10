@@ -29,8 +29,9 @@ fn metadata_bytes(file: &File, len: u64, h: &Header) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Abre y comprueba todo lo barato: cabeceras, metadatos, estructura y compuestos.
-/// No lee pesos; para eso está `verify_tensors`.
+/// Abre y comprueba todo lo barato: cabeceras, metadatos, estructura, compuestos y el hash de
+/// los recursos sin tensores (tokenizer, configuración, plantilla: pocos MB). No lee pesos;
+/// para eso está `verify_tensors`.
 pub fn open(path: &Path) -> Result<Opened> {
     let file = File::open(path).with_context(|| format!("no abro {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -39,6 +40,11 @@ pub fn open(path: &Path) -> Result<Opened> {
     let metadata = Metadata::decode(&bytes)?;
     metadata.validate(header.metadata_offset)?;
     ensure!(metadata.identity() == header.identity, "la identidad de la cabecera no corresponde a sus metadatos");
+    for c in metadata.components.iter().filter(|c| c.tensor_count == 0 && c.payload_size > 0) {
+        let mut buf = vec![0u8; usize::try_from(c.payload_size)?];
+        file.read_exact_at(&mut buf, c.payload_offset)?;
+        ensure!(xxh3_128(&buf) == c.bytes_hash, "el recurso {} no cuadra con su hash: fichero dañado", c.name);
+    }
     Ok(Opened { slot, header, metadata })
 }
 
