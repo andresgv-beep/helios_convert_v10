@@ -301,9 +301,12 @@ Con `append_vision` sale el mismo TNIH que construyéndolo de una vez con texto 
 - **Colocación (auditoría de GPT, 2026-11-03):** el motor decide con `gemma4_placement` y tres
   estados explícitos: entra en la principal, se reparte (con `boundary` 0 válido: todas las capas
   en la secundaria) o no cabe, con error antes de cargar nada. La torre va a la principal si cabe
-  junto al texto. Si no, va a la secundaria repartiendo el texto; si el texto cabría solo, la
-  última capa cruza para que el reparto no quede vacío. Si la torre no cabe en ningún sitio, el
-  modelo abre solo con texto y no anuncia visión. El E4B, en la 4070 Ti, va entero con su torre;
+  junto al texto. Si el texto cabe entero en la principal y la torre sola en la secundaria, cada
+  uno va a su tarjeta sin repartir capas. Si no, el texto se reparte y la torre va a la
+  secundaria. Si la torre no cabe en ningún sitio, el modelo abre solo con texto y no anuncia
+  visión. Los modelos con KV compartido (E2B, E4B) nunca reparten el texto: sus últimas 18 capas
+  leen el KV de capas anteriores. Con la 2080 Ti de principal, el E4B q8 va entero con su torre a
+  16k, con la torre sola en la 4070 Ti a 32k y 48k, y a partir de 64k no cabe y lo dice al abrir. El E4B, en la 4070 Ti, va entero con su torre;
   el 26B sigue repartido 17+13 con la torre en la 2080 Ti.
 - **Texto sin cambios:** en el conjunto final de 40 documentos, el HNF con visión da con 20 capas
   en la 4070 Ti la misma KL que el refinado sin visión, documento a documento (0,5404). Con el
