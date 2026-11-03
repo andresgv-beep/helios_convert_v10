@@ -157,7 +157,7 @@ componente puede declarar una cota fija calculada en el máximo admitido.
 
 Lista ordenada de pasos. Cada paso:
 
-- tipo: convertir, capturar importancia, refinar, sellar, migrar;
+- tipo: convertir, capturar importancia, refinar, sellar, migrar, añadir componente (6);
 - estado: completo, en curso o cancelado;
 - herramienta, versión y commit;
 - identidad de entrada y de salida;
@@ -258,10 +258,38 @@ Pendiente:
     forma, y más columnas lógicas que físicas, también en el lector del motor;
   - `compare` exige el mismo inventario en los dos sentidos y los mismos descriptores, y antes de
     comparar recalcula los hashes de los bytes de los dos ficheros.
-- Ya no: `hnf_refine` sobre HNFv10 con `hnf10 begin-edit` y `hnf10 seal` funciona; con las capas 0
-  y 1 del 26B da 0 tensores cambiados.
-- `hnf_refine` y `hnf-seal` siguen escribiendo HNFv9; falta pasarlos a v10 con los pasos
-  «en curso» y «completo».
-- El conversor de safetensors a HNFv10 directo.
-- Las fórmulas de memoria y el reparto de GPUs con visión.
-- Regenerar los HNF de prueba del motor.
+- Hecho desde entonces: `hnf_refine` solo trabaja sobre HNFv10 (`hnf10 begin-edit` y `hnf10 seal`),
+  `hnf10 convert` convierte de safetensors a HNFv10, las pruebas del motor fabrican sus HNFv10 con
+  `tests/hnf10_test_writer.hpp` y el motor ya no lee HNFv9 (retirada del v9, 2026-11-03).
+
+## 15. Visión del 26B (2026-11-03)
+
+`hnf10 add-vision --from texto.v10.hnf --model checkpoint/ --to salida.v10.hnf` copia el HNF de
+texto con sus mismos bytes y le añade la torre visual como componente VISION opcional, que depende
+del texto. El 26B refinado gana visión sin volver a convertir ni a refinar: los 657 tensores de
+texto, el tokenizer y la plantilla salen idénticos (`hnf10 compare`), y el TNIH solo cambia en los
+campos de cabecera que apuntan a la visión (VisionModelConfigBin y GM4V van detrás, alineados a 32).
+Con `append_vision` sale el mismo TNIH que construyéndolo de una vez con texto y visión.
+
+- **Torre:** 27 capas de 1152, 16 cabezas con head_dim 72, sin clamps aprendidos, con
+  `standardize`. Son 356 tensores en FP16 (1,15 GB). `std_bias` y `std_scale` son reales en el
+  checkpoint (bias hasta ±5·10⁴) y van como `vision.projector.std_bias` / `std_scale`, que tienen
+  que entrar exactos en FP16 o la conversión falla. El 2 % de los valores de los pesos son
+  subnormales en FP16; su número queda en la procedencia (`fp16_inexact_values`).
+- **Memoria:** la fórmula del componente (variable 3, parches por imagen, máximo 2520; variable 2,
+  una imagen) da 330 MB de trabajo en el máximo: lineal por parche más las puntuaciones de
+  atención en parches². Medido en el motor: 1,15 GB de pesos y 352 MB de trabajo con cuBLAS.
+- **Atención del decoder:** `use_bidirectional_attention = "vision"` va como propiedad tipada de la
+  configuración: los soft tokens de una imagen se ven entre sí en las capas deslizantes.
+- **Fidelidad:** contra el oráculo FP32 de transformers 5.22 (`tools/gemma4_vision_oracle.py` del
+  motor), NRMSE 0,05 % tras la capa 0, 1,2 % tras la 26 y 1,06 % en la salida proyectada
+  (correlación 0,99994). El residual de la torre no pasa de ±2512 y cabe en FP16. El pool sí pasa
+  del rango FP16 (−68 875), por eso se estandariza en FP32 antes de bajar a FP16.
+- **Reparto:** el motor guarda en la GPU 1 el sitio que pide la visión (pesos más fórmula en el
+  máximo) antes de colocar capas de texto: quedan 18 capas en la 4070 Ti y 12 en la 2080 Ti. La
+  torre corre en la 2080 Ti y el prefill de la imagen cruza las dos GPUs.
+
+Pendiente:
+- Medir en el decoder si la imagen cambia algo frente a la referencia (solo hay oráculo de la torre).
+- Mantener cargada la visión entre imágenes (hoy se carga y descarga por turno salvo con
+  `HELIOS_VISION_MMAP=1`).

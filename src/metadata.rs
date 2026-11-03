@@ -25,6 +25,7 @@ pub mod step {
     pub const REFINE: u32 = 3;
     pub const SEAL: u32 = 4;
     pub const MIGRATE: u32 = 5;
+    pub const ADD_COMPONENT: u32 = 6;
     pub const COMPLETE: u32 = 1;
     pub const IN_PROGRESS: u32 = 2;
     pub const CANCELLED: u32 = 3;

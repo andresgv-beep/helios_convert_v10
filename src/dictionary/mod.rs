@@ -161,7 +161,9 @@ pub const VISION_PATTERNS: &[&str] = &[
     "vision.layer{N}.mlp.down.output_min",
     "vision.layer{N}.mlp.down.output_max",
     "vision.projector.weight",
-    
+    "vision.projector.std_bias",
+    "vision.projector.std_scale",
+
     // Gemma 4 «unified» (12B): embebedor sin torre, parches crudos -> decoder.
     "vision.patch_ln1.weight",
     "vision.patch_ln1.bias",

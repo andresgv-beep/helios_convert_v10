@@ -19,6 +19,14 @@ enum Command {
         /// Commit de helios_convert_v10 con el que se migra, para la procedencia.
         #[arg(long, default_value = "")] commit: String,
     },
+    /// Añade la torre visual del checkpoint a un HNFv10 de texto sin tocar sus pesos.
+    AddVision {
+        #[arg(long)] from: PathBuf,
+        /// Carpeta del checkpoint original (config.json, processor_config.json, safetensors).
+        #[arg(long)] model: PathBuf,
+        #[arg(long)] to: PathBuf,
+        #[arg(long, default_value = "")] commit: String,
+    },
     /// Componentes, tensores y procedencia.
     Info { file: PathBuf },
     /// Verificación profunda: el hash de cada tensor y de cada payload.
@@ -71,6 +79,11 @@ fn main() -> Result<()> {
             let report = migrate(&from, &to, template.as_deref(), &commit)?;
             for note in &report.notes { println!("{note}"); }
             println!("listo: {} ({} tensores, {} bytes de texto), identidad {}", to.display(), report.tensors, report.text_bytes, hex(&report.identity));
+        }
+        Command::AddVision { from, model, to, commit } => {
+            let r = helios_convert_v10::vision::add_vision(&from, &model, &to, &commit)?;
+            println!("listo: {} ({} tensores de visión, {} bytes; {} valores no exactos en FP16; memoria de trabajo {} bytes con el máximo de parches), identidad {}",
+                to.display(), r.tensors, r.weight_bytes, r.inexact, r.scratch_bytes_at_max, hex(&r.identity));
         }
         Command::Info { file } => {
             let o = open(&file)?;

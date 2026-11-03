@@ -45,8 +45,11 @@ impl Gemma4VisionMapper {
         if num_layers == 0 {
             anyhow::bail!("Gemma 4 vision_config has no valid num_hidden_layers");
         }
-        if vision.get("use_clipped_linears").and_then(Value::as_bool) != Some(true) {
-            anyhow::bail!("Gemma 4 vision mapper requires use_clipped_linears=true");
+        // E2B/E4B: clamps aprendidos en cada lineal. 26B: sin clamps, con los
+        // buffers de standardize (std_bias, std_scale) tras el pool.
+        if vision.get("use_clipped_linears").and_then(Value::as_bool).is_none()
+            || vision.get("standardize").and_then(Value::as_bool).is_none() {
+            anyhow::bail!("Gemma 4 vision_config needs use_clipped_linears and standardize");
         }
 
         let processor_path = model_path.join("processor_config.json");
@@ -85,6 +88,10 @@ impl Gemma4VisionMapper {
             )
             .unwrap(),
         })
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.vision.get(key).and_then(Value::as_bool).unwrap_or(false)
     }
 
     fn layer_mapping(&self, layer: usize, suffix: &str) -> Option<TensorMapping> {
@@ -161,6 +168,18 @@ impl ModelMapper for Gemma4VisionMapper {
             }
             "model.embed_vision.embedding_projection.weight" => Some(TensorMapping::new(
                 "vision.projector.weight",
+                QuantHint::FP16,
+                TensorCategory::VisionProjector,
+            )),
+            // Son de la torre, pero se aplican justo antes del proyector: con ese
+            // prefijo entran en su fase de pesos en el motor.
+            "model.vision_tower.std_bias" if self.flag("standardize") => Some(TensorMapping::new(
+                "vision.projector.std_bias",
+                QuantHint::FP16,
+                TensorCategory::VisionProjector,
+            )),
+            "model.vision_tower.std_scale" if self.flag("standardize") => Some(TensorMapping::new(
+                "vision.projector.std_scale",
                 QuantHint::FP16,
                 TensorCategory::VisionProjector,
             )),
@@ -258,7 +277,8 @@ impl ModelMapper for Gemma4VisionMapper {
     }
 
     fn expected_tensor_count(&self) -> Option<usize> {
-        Some(3 + self.num_layers() * 41)
+        let per_layer = if self.flag("use_clipped_linears") { 41 } else { 13 };
+        Some(3 + self.num_layers() * per_layer + if self.flag("standardize") { 2 } else { 0 })
     }
 }
 

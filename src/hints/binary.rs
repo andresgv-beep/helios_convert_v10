@@ -536,6 +536,30 @@ pub fn build_execution_hints_binary(hints_json: &Value) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Añade la visión (VisionModelConfigBin y GM4V) a una configuración TNIH que solo trae texto,
+/// sin tocar sus bytes: la torre se coloca detrás, alineada a 32 como el resto.
+pub fn append_vision(hints: &[u8], vision: &Value) -> Result<Vec<u8>> {
+    let u16_at = |o: usize| u16::from_le_bytes([hints[o], hints[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(hints[o..o + 4].try_into().unwrap());
+    anyhow::ensure!(hints.len() >= ExecutionHintsBin::SIZE && u32_at(0) == HINTS_MAGIC, "configuración sin magic TNIH");
+    anyhow::ensure!(u16_at(34) == 0 && u32_at(12) == 0 && u32_at(56) == 0, "la configuración ya tiene visión");
+    anyhow::ensure!(hints.len() % 32 == 0, "configuración TNIH sin alinear a 32");
+    let extension = build_gemma4_vision_extension(vision)?;
+    let mut buf = hints.to_vec();
+    let vision_offset = buf.len() as u32;
+    buf.extend_from_slice(&VisionModelConfigBin::from_json(vision).to_bytes());
+    let extension_offset = buf.len() as u32;
+    buf.extend_from_slice(&extension);
+    buf.resize((buf.len() + 31) / 32 * 32, 0);
+    buf[12..16].copy_from_slice(&vision_offset.to_le_bytes());
+    buf[34..36].copy_from_slice(&1u16.to_le_bytes());
+    let flags = u32_at(40) | 0x0002;
+    buf[40..44].copy_from_slice(&flags.to_le_bytes());
+    buf[56..60].copy_from_slice(&extension_offset.to_le_bytes());
+    buf[60..64].copy_from_slice(&(extension.len() as u32).to_le_bytes());
+    Ok(buf)
+}
+
 /// Gemma 4 vision extension, fixed 96-byte record.
 ///
 /// The parent header uses the eight bytes still free after the GM4X pointer:
@@ -817,6 +841,23 @@ mod tests {
                 "position_order": "xy"
             }
         })
+    }
+
+    /// Añadir visión a un TNIH de texto: los bytes de texto no cambian, solo la cabecera, y
+    /// el resultado es igual al que se construye de una vez con texto y visión.
+    #[test]
+    fn append_vision_keeps_text_bytes_and_matches_combined_build() {
+        let text = serde_json::json!({"arch": "qwen2", "hidden_size": 64, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 4, "vocab_size": 100, "intermediate_size": 128});
+        let mut vision = gemma4_vision_json();
+        vision["use_clipped_linears"] = false.into();
+        vision["standardize"] = true.into();
+        let text_only = build_execution_hints_binary(&text).unwrap();
+        let appended = append_vision(&text_only, &vision).unwrap();
+        assert_eq!(&appended[64..text_only.len()], &text_only[64..]);
+        let combined = build_execution_hints_binary(&serde_json::json!({"text": text, "vision": vision})).unwrap();
+        assert_eq!(appended, combined);
+        assert!(append_vision(&appended, &vision).is_err(), "dos veces no");
     }
 
     #[test]
