@@ -234,6 +234,15 @@ Desde safetensors, sin el v9.1 ni scripts:
 
 La cadena reproduce el modelo bit a bit.
 
+Desde el 2026-11-03 la cadena es un solo comando, `scripts/regenerar-26b.sh`, que incluye la visión.
+Las entradas (calibración e importancia de Héctor, 54 MB con su SHA256SUMS) están en el NAS, en
+`compartido/modelo-26b/regeneracion/`. Primera ejecución: 60 minutos (13 de conversión, 41 de
+refinado, 2 de visión). Frente al canónico de HEXOS, **1013 tensores iguales** (657 de texto y 356
+de visión), con tokenizer, configuración y plantilla iguales. El fichero no es idéntico byte a
+byte, porque la conversión directa alinea cada tensor a 4 KiB y el canónico conserva la
+disposición del v9 del que se migró. Por eso cambian los offsets y la identidad, pero no ningún
+peso.
+
 ## 14. Independiente del v9.1 (2026-11-03)
 
 `helios_convert_v10` ya no depende de `helios_convert_v9.1`. Los módulos que usa (codificadores
