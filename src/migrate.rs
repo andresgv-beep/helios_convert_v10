@@ -89,7 +89,7 @@ pub fn migrate(from: &Path, to: &Path, template: Option<&Path>, commit: &str) ->
     ensure!(tnih.len() >= 64 && u32_at(tnih, 0) == 0x48494E54, "configuración binaria sin magic");
     let text_offset = u32_at(tnih, 8) as usize;
     let text_bin = tnih.get(text_offset..text_offset + 128).context("configuración de texto fuera del bloque")?;
-    let expected = helios_convert::hints::TextModelConfigBin::from_json(&hints["text"]).to_bytes();
+    let expected = crate::hints::TextModelConfigBin::from_json(&hints["text"]).to_bytes();
     let differing: Vec<usize> = (0..128).filter(|&i| expected[i] != text_bin[i]).collect();
     ensure!(differing.is_empty(), "la configuración binaria no dice lo mismo que el JSON en los bytes {differing:?}");
     let flags = u32_at(tnih, 40);

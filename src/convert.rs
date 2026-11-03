@@ -9,8 +9,8 @@ use crate::format::{align_up, xxh3_128};
 use crate::metadata::{kind, step, Component, Metadata, Property, Step, Tensor, Value};
 use crate::migrate::text_param;
 use anyhow::{ensure, Context, Result};
-use helios_convert::moe_experimental::{emit_tensor_with_importance, make_plan_with, DenseFormat};
-use helios_convert::SafetensorReader;
+use crate::moe_experimental::{emit_tensor_with_importance, make_plan_with, DenseFormat};
+use crate::SafetensorReader;
 use std::io::Write;
 use std::path::Path;
 
@@ -40,17 +40,17 @@ fn layer_of(name: &str) -> i32 {
 pub fn convert(o: &Options) -> Result<[u8; 16]> {
     ensure!(!o.out.exists(), "{} ya existe", o.out.display());
     let plan = make_plan_with(o.model, o.dense)?;
-    let tokenizer = helios_convert::htf::build_htf(o.model)?;
+    let tokenizer = crate::htf::build_htf(o.model)?;
     ensure!(tokenizer.len() > 64, "falta el tokenizer");
     let config = plan.binary_hints()?;
     // El binario tiene que decir lo mismo que la configuración del plan; lo que el binario no
     // trae va como propiedad tipada (hoy, final_logit_softcapping).
     let text_offset = u32::from_le_bytes(config[8..12].try_into().unwrap()) as usize;
-    let expected = helios_convert::hints::TextModelConfigBin::from_json(&plan.text).to_bytes();
+    let expected = crate::hints::TextModelConfigBin::from_json(&plan.text).to_bytes();
     ensure!(config.get(text_offset..text_offset + 128) == Some(&expected[..]), "la configuración binaria no coincide con el plan");
     let softcap = plan.text["final_logit_softcapping"].as_f64().context("falta final_logit_softcapping en el plan")?;
     let template = std::fs::read(o.model.join("chat_template.jinja")).ok();
-    let base_id = helios_convert::base_id::compute(o.model)?;
+    let base_id = crate::base_id::compute(o.model)?;
     let reader = SafetensorReader::from_folder(o.model)?;
 
     // Disposición del texto: un tensor tras otro, cada uno alineado a 4 KiB.

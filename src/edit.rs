@@ -36,6 +36,16 @@ pub fn begin_edit(from: &Path, to: &Path, tool: &str, pattern: &str, kind: u32) 
     Ok(touched.len())
 }
 
+/// Tokenizer, configuración, plantilla…: una edición de pesos no los toca, así que tienen que
+/// seguir con su hash antes de cerrar.
+fn check_resources(session: &Session, md: &Metadata) -> Result<()> {
+    for c in md.components.iter().filter(|c| c.tensor_count == 0 && c.payload_size > 0) {
+        ensure!(tensor_hash(session, c.payload_offset, c.payload_size)? == c.bytes_hash,
+            "el recurso {} cambió durante la edición", c.name);
+    }
+    Ok(())
+}
+
 /// El paso «en curso» de un fichero, o error si no lo hay.
 fn pending(md: &Metadata) -> Result<usize> {
     let i = md.provenance.len().checked_sub(1).context("sin procedencia")?;
@@ -50,6 +60,7 @@ pub fn seal(path: &Path, params: Vec<Property>, calibration: &str) -> Result<usi
     ensure!(session.current().header.state == State::InProgress, "{} no tiene una edición en curso", path.display());
     let mut md = session.current().metadata.clone();
     let i = pending(&md)?;
+    check_resources(&session, &md)?;
     let touched: std::collections::HashSet<String> = md.provenance[i].touched.iter().cloned().collect();
     let mut changed = 0;
     for t in 0..md.tensors.len() {
@@ -82,6 +93,7 @@ pub fn repair(path: &Path) -> Result<()> {
     ensure!(session.current().header.state == State::InProgress, "{} no necesita reparación", path.display());
     let mut md = session.current().metadata.clone();
     let i = pending(&md)?;
+    check_resources(&session, &md)?;
     for t in &md.tensors {
         if tensor_hash(&session, t.offset, t.size)? != t.hash {
             bail!("{} ya cambió: termina la edición (vuelve a lanzar la herramienta y sella) o regenera el fichero", t.name);

@@ -295,6 +295,21 @@ impl Metadata {
         xxh3_128(&buf)
     }
 
+    /// Bytes que ocupan `elements` pesos en `dtype`, o None si el dtype no se conoce.
+    pub fn bytes_for(dtype: &str, elements: u64) -> Option<u64> {
+        let block = |bytes: u64| (elements % 256 == 0).then(|| elements / 256 * bytes);
+        match dtype {
+            "fp32" | "int32" => Some(elements * 4),
+            "fp16" | "bf16" => Some(elements * 2),
+            "int8" => Some(elements),
+            "hq44k_g16" => block(152),
+            "hq52k" => block(184),
+            "hq62k" => block(264),
+            "hq8k" => block(272),
+            _ => None,
+        }
+    }
+
     /// Todo lo que el lector comprueba siempre (§2, §4–§6), sin leer pesos.
     pub fn validate(&self, metadata_offset: u64) -> Result<()> {
         let mut ids = BTreeSet::new();
@@ -357,6 +372,15 @@ impl Metadata {
         tensors.sort();
         for w in tensors.windows(2) { ensure!(w[0].1 <= w[1].0, "{} y {} se solapan", w[0].2, w[1].2); }
         ensure!(self.tensors.iter().all(|t| ids.contains(&t.component)), "tensor de un componente inexistente");
+        // Nombres únicos y tamaño coherente con dtype y forma física.
+        let mut names = BTreeSet::new();
+        for t in &self.tensors {
+            ensure!(names.insert(t.name.as_str()), "tensor {} repetido", t.name);
+            let elements = t.shape.iter().try_fold(1u64, |a, &d| a.checked_mul(d)).context("forma desbordada")?;
+            let expected = Self::bytes_for(&t.dtype, elements).with_context(|| format!("{}: dtype {} desconocido o forma no divisible", t.name, t.dtype))?;
+            ensure!(expected == t.size, "{}: {} bytes para {:?} en {}, se esperaban {}", t.name, t.size, t.shape, t.dtype, expected);
+            ensure!(t.logical_last <= *t.shape.last().unwrap_or(&0), "{}: más columnas lógicas que físicas", t.name);
+        }
         for (c, p) in &self.properties { ensure!(ids.contains(c), "propiedad {} de un componente inexistente", p.key); }
         ensure!(metadata_offset % ALIGN == 0, "metadatos mal alineados");
         Ok(())

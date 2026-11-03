@@ -219,3 +219,32 @@ fn edit_seal_and_repair() {
     assert!(repair(&to).is_err());
     assert!(open(&to).is_err());
 }
+
+/// Hallazgos de GPT: recursos sin tensores en seal/repair e índice con duplicados o geometría rota.
+#[test]
+fn seal_checks_resources_and_index_checks_geometry() {
+    use helios_convert_v10::edit::{begin_edit, repair, seal};
+    let base = temp("recursos");
+    let md = sample(&base);
+    let config = md.components.iter().find(|c| c.kind == kind::CONFIG).unwrap().clone();
+    let to = temp("recursos-seal");
+    begin_edit(&base, &to, "prueba", ".moe.experts.", step::REFINE).unwrap();
+    OpenOptions::new().write(true).open(&to).unwrap().write_all_at(b"X", config.payload_offset).unwrap();
+    assert!(seal(&to, vec![], "").unwrap_err().to_string().contains("recurso"));
+    assert!(repair(&to).unwrap_err().to_string().contains("recurso"));
+    assert!(open(&to).is_err());
+
+    let offset = open(&base).unwrap().header.metadata_offset;
+    let mut twice = md.clone();
+    twice.tensors[1].name = twice.tensors[0].name.clone();
+    assert!(twice.validate(offset).unwrap_err().to_string().contains("repetido"));
+    let mut shape = md.clone();
+    shape.tensors[0].shape = vec![20, 26];
+    assert!(shape.validate(offset).unwrap_err().to_string().contains("se esperaban"));
+    let mut dtype = md.clone();
+    dtype.tensors[0].dtype = "fp7".into();
+    assert!(dtype.validate(offset).unwrap_err().to_string().contains("desconocido"));
+    let mut logical = md.clone();
+    logical.tensors[0].logical_last = 99;
+    assert!(logical.validate(offset).unwrap_err().to_string().contains("lógicas"));
+}

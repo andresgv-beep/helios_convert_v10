@@ -49,6 +49,8 @@ enum Command {
         /// record.json de la herramienta (hnf_refine lo deja en su carpeta de trabajo).
         #[arg(long)] record: Option<PathBuf>,
     },
+    /// Compara dos HNFv10 tensor a tensor: iguales, misma rejilla HQ44 con otros códigos, o distintos.
+    Compare { a: PathBuf, b: PathBuf },
     /// Cancela una edición cortada si los pesos siguen intactos.
     Repair { file: PathBuf },
     /// HNFv10 de prueba para el lector del motor (Hector-engine/tests/data/hnf10).
@@ -88,7 +90,7 @@ fn main() -> Result<()> {
         }
         Command::Convert { model, out, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
-            let dense = if dense_hq8 { helios_convert::moe_experimental::DenseFormat::Hq8 } else { helios_convert::moe_experimental::DenseFormat::Hq44 };
+            let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {
                 model: &model, out: &out, dense, importance: importance.as_deref(), commit: &commit, batch_rows: 128 })?;
             println!("listo: {}, identidad {}", out.display(), hex(&identity));
@@ -107,6 +109,46 @@ fn main() -> Result<()> {
             }
             let changed = edit::seal(&file, params, &calibration)?;
             println!("sellado: {changed} tensores cambiaron");
+        }
+        Command::Compare { a, b } => {
+            use std::os::unix::fs::FileExt;
+            let (oa, ob) = (open(&a)?, open(&b)?);
+            // Los hashes guardados solo valen si los bytes los cumplen.
+            for (path, opened) in [(&a, &oa), (&b, &ob)] {
+                let bad = verify_tensors(path, &opened.metadata)?;
+                anyhow::ensure!(bad.is_empty(), "{}: bytes que no cumplen su hash: {bad:?}", path.display());
+            }
+            let (fa, fb) = (std::fs::File::open(&a)?, std::fs::File::open(&b)?);
+            let index: std::collections::HashMap<&str, &helios_convert_v10::metadata::Tensor> =
+                ob.metadata.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+            let (mut same, mut grid, mut other) = (0, 0, Vec::new());
+            for t in &oa.metadata.tensors {
+                let Some(u) = index.get(t.name.as_str()) else { other.push(format!("{} falta en B", t.name)); continue };
+                let kind_of = |o: &helios_convert_v10::file::Opened, id: u32| o.metadata.components.iter().find(|c| c.id == id).map(|c| c.kind);
+                if t.dtype != u.dtype || t.shape != u.shape || t.logical_last != u.logical_last || t.experts != u.experts
+                    || t.layer != u.layer || t.size != u.size || kind_of(&oa, t.component) != kind_of(&ob, u.component) {
+                    other.push(format!("{}: descriptores distintos", t.name));
+                    continue;
+                }
+                if t.hash == u.hash { same += 1; continue; }
+                if t.dtype == "hq44k_g16" {
+                    let (mut x, mut y) = (vec![0u8; t.size as usize], vec![0u8; u.size as usize]);
+                    fa.read_exact_at(&mut x, t.offset)?; fb.read_exact_at(&mut y, u.offset)?;
+                    if x.chunks_exact(152).zip(y.chunks_exact(152)).all(|(p, q)| p[..24] == q[..24]) { grid += 1; continue; }
+                }
+                other.push(t.name.clone());
+            }
+            let names_a: std::collections::HashSet<&str> = oa.metadata.tensors.iter().map(|t| t.name.as_str()).collect();
+            for u in &ob.metadata.tensors { if !names_a.contains(u.name.as_str()) { other.push(format!("{} sobra en B", u.name)); } }
+            println!("{same} tensores iguales, {grid} HQ44 con la misma rejilla y otros códigos, {} distintos", other.len());
+            for name in other.iter().take(20) { println!("  distinto: {name}"); }
+            for c in oa.metadata.components.iter().filter(|c| c.tensor_count == 0) {
+                let twin = ob.metadata.components.iter().find(|d| d.kind == c.kind);
+                println!("  componente {}: {}", c.name, match twin { Some(d) if d.bytes_hash == c.bytes_hash => "igual", Some(_) => "DISTINTO", None => "falta en B" });
+            }
+            for d in ob.metadata.components.iter().filter(|d| !oa.metadata.components.iter().any(|c| c.kind == d.kind)) {
+                println!("  componente {}: sobra en B", d.name);
+            }
         }
         Command::Repair { file } => {
             edit::repair(&file)?;

@@ -218,11 +218,48 @@ Migrado con `hnf10 migrate`, desde el HNFv9 sellado que cargaba HEXOS
 - HEXOS carga el HNFv10 desde el 2026-11-03:
   `helios_convert_v10/output/gemma4-26b-moe-dense-hq8-gptq.v10.hnf`, con su `.sha256`.
 
+## 13. Cadena completa en HNFv10 (2026-11-03)
+
+Desde safetensors, sin el v9.1 ni scripts:
+
+1. `hnf10 convert --dense-hq8 --importance importancia-hector-v1`: frente al HNFv10 de HEXOS,
+   597 tensores iguales, 60 tensores HQ44 de expertos con la misma rejilla (cabeceras de bloque
+   idénticas; solo cambian los códigos, que en aquel están refinados), y tokenizer,
+   configuración y plantilla iguales.
+2. `hnf10 begin-edit` sobre esa conversión, `hnf_refine` de las 30 capas en 41 minutos y
+   `hnf10 seal --record`: 60 tensores cambiados.
+3. `hnf10 compare` con el HNFv10 de HEXOS, recalculando antes los bytes de los dos: **657
+   tensores iguales**, mismos descriptores e inventario, y tokenizer, configuración y plantilla
+   iguales.
+
+La cadena reproduce el modelo bit a bit.
+
+## 14. Independiente del v9.1 (2026-11-03)
+
+`helios_convert_v10` ya no depende de `helios_convert_v9.1`. Los módulos que usa (codificadores
+`hqs`, `mapping`, `safetensor`, el tokenizer `htf`, la configuración binaria `hints`,
+`dictionary`, `base_id` y el plan `moe_experimental`) se trajeron tal como estaban en el commit
+`79835e4` de la rama `gemma4-26b-moe`, sin el escritor HNFv9 ni sus binarios. Desde aquí
+evolucionan en el v10. El v9.1 queda como pieza histórica y no se vuelve a tocar. Cuando el conversor v10 funcione de punta a punta y Héctor
+esté integrado y probado solo con HNFv10 (incluidos los HNF de prueba del motor regenerados en v10), se
+quitará toda referencia al v9.1: la ruta v9 del cargador de Héctor y el uso de HNFv9 en las
+herramientas. Decisión de Andrés, 2026-11-03. Pruebas: 62
+de los módulos traídos y 6 del contenedor.
+
 Pendiente:
 - Revisión de GPT (2026-11-03) corregida: las confirmaciones van en una `Session` con cerrojo exclusivo
   y comprueban en disco la secuencia vigente; cada tensor debe estar en exactamente un rango de
   componente y dentro de la zona de payloads; las fórmulas de memoria se validan (variables, exponentes,
   coeficientes y máximos). Lo mismo en el lector del motor.
+- Segunda revisión de GPT (2026-11-03) corregida:
+  - `seal` y `repair` comprueban también el hash del tokenizer, la configuración y la plantilla
+    antes de cerrar;
+  - el índice rechaza nombres repetidos, dtypes desconocidos, tamaños que no cuadran con dtype y
+    forma, y más columnas lógicas que físicas, también en el lector del motor;
+  - `compare` exige el mismo inventario en los dos sentidos y los mismos descriptores, y antes de
+    comparar recalcula los hashes de los bytes de los dos ficheros.
+- Ya no: `hnf_refine` sobre HNFv10 con `hnf10 begin-edit` y `hnf10 seal` funciona; con las capas 0
+  y 1 del 26B da 0 tensores cambiados.
 - `hnf_refine` y `hnf-seal` siguen escribiendo HNFv9; falta pasarlos a v10 con los pasos
   «en curso» y «completo».
 - El conversor de safetensors a HNFv10 directo.
