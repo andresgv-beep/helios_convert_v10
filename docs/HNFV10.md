@@ -288,6 +288,12 @@ Con `append_vision` sale el mismo TNIH que construyéndolo de una vez con texto 
 - **Reparto:** el motor guarda en la GPU 1 el sitio que pide la visión (pesos más fórmula en el
   máximo) antes de colocar capas de texto: quedan 18 capas en la 4070 Ti y 12 en la 2080 Ti. La
   torre corre en la 2080 Ti y el prefill de la imagen cruza las dos GPUs.
+- **Texto sin cambios:** en el conjunto final de 40 documentos, el HNF con visión da con 20 capas
+  en la 4070 Ti la misma KL que el refinado sin visión, documento a documento (0,5404). Con el
+  reparto de HEXOS (18 + 12) da 0,5405 / 0,5795 / argmax 0,793, que es ruido de pasar una capa más
+  a la 2080 Ti.
+- **Copia de seguridad:** en el NAS, `compartido/modelo-26b/`, con su `.sha256` verificado. Es el
+  único HNF del 26B que queda allí.
 
 Pendiente:
 - Medir en el decoder si la imagen cambia algo frente a la referencia (solo hay oráculo de la torre).
