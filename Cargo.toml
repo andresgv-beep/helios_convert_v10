@@ -11,6 +11,7 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 memmap2 = "0.9"
 serde_json = "1.0"
+rayon = "1.8"
 # Solo para el migrador: leer la configuración binaria de HNFv9 con el mismo código que la escribió.
 helios-convert = { path = "../helios_convert_v9.1" }
 crc32fast = "1.3"

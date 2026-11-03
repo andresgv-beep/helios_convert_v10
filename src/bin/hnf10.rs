@@ -1,7 +1,7 @@
 //! hnf10: herramientas del contenedor HNFv10.
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use helios_convert_v10::{file::{open, verify_tensors}, metadata::Value, migrate::migrate};
+use helios_convert_v10::{edit, file::{open, verify_tensors}, fixtures, metadata::{step, Value}, migrate::migrate};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -23,6 +23,42 @@ enum Command {
     Info { file: PathBuf },
     /// Verificación profunda: el hash de cada tensor y de cada payload.
     Verify { file: PathBuf },
+    /// Convierte un checkpoint Gemma 4 MoE de safetensors a HNFv10.
+    Convert {
+        #[arg(long)] model: PathBuf,
+        #[arg(long)] out: PathBuf,
+        /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
+        #[arg(long)] dense_hq8: bool,
+        /// Importancia HQ44 por experto (layerN.gate_up.f32 y layerN.down.f32).
+        #[arg(long)] importance: Option<PathBuf>,
+        #[arg(long, default_value = "")] commit: String,
+        #[arg(long, default_value_t = 10)] threads: usize,
+    },
+    /// Copia un HNFv10 y deja la copia «en curso» para que una herramienta modifique pesos.
+    BeginEdit {
+        #[arg(long)] from: PathBuf,
+        #[arg(long)] to: PathBuf,
+        /// Herramienta que hará la edición, para la procedencia.
+        #[arg(long, default_value = "hnf_refine")] tool: String,
+        /// Se tocan los tensores cuyo nombre contiene este texto.
+        #[arg(long, default_value = ".moe.experts.")] touch: String,
+    },
+    /// Cierra una edición: hashes nuevos, comprobación del resto y parámetros del registro.
+    Seal {
+        file: PathBuf,
+        /// record.json de la herramienta (hnf_refine lo deja en su carpeta de trabajo).
+        #[arg(long)] record: Option<PathBuf>,
+    },
+    /// Cancela una edición cortada si los pesos siguen intactos.
+    Repair { file: PathBuf },
+    /// HNFv10 de prueba para el lector del motor (Hector-engine/tests/data/hnf10).
+    #[command(hide = true)]
+    Fixtures { dir: PathBuf },
+}
+
+fn rayon_threads(n: usize) -> Result<()> {
+    rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
+    Ok(())
 }
 
 fn hex(h: &[u8; 16]) -> String { h.iter().map(|b| format!("{b:02x}")).collect() }
@@ -49,6 +85,36 @@ fn main() -> Result<()> {
             for s in &o.metadata.provenance {
                 println!("  paso {} «{}» {} {} params, {} tensores tocados", s.kind, s.tool, s.version, s.params.len(), s.touched.len());
             }
+        }
+        Command::Convert { model, out, dense_hq8, importance, commit, threads } => {
+            rayon_threads(threads)?;
+            let dense = if dense_hq8 { helios_convert::moe_experimental::DenseFormat::Hq8 } else { helios_convert::moe_experimental::DenseFormat::Hq44 };
+            let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {
+                model: &model, out: &out, dense, importance: importance.as_deref(), commit: &commit, batch_rows: 128 })?;
+            println!("listo: {}, identidad {}", out.display(), hex(&identity));
+        }
+        Command::BeginEdit { from, to, tool, touch } => {
+            let n = edit::begin_edit(&from, &to, &tool, &touch, step::REFINE)?;
+            println!("{}: {n} tensores en edición por {tool}", to.display());
+        }
+        Command::Seal { file, record } => {
+            let (mut params, mut calibration) = (Vec::new(), String::new());
+            if let Some(path) = record {
+                let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                anyhow::ensure!(json["complete"] == true, "el registro dice que la herramienta no terminó");
+                helios_convert_v10::migrate::flat_params(&json, &mut params);
+                calibration = json["calibration"]["ids_fnv1a64"].as_str().unwrap_or("").to_string();
+            }
+            let changed = edit::seal(&file, params, &calibration)?;
+            println!("sellado: {changed} tensores cambiaron");
+        }
+        Command::Repair { file } => {
+            edit::repair(&file)?;
+            println!("reparado: la edición se cerró como cancelada");
+        }
+        Command::Fixtures { dir } => {
+            fixtures::write(&dir)?;
+            println!("fixtures en {}", dir.display());
         }
         Command::Verify { file } => {
             let o = open(&file)?;

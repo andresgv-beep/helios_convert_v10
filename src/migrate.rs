@@ -38,7 +38,7 @@ fn section(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
     data.get(start..start + usize::try_from(size)?).context("rango fuera del HNFv9")
 }
 
-fn text_param(key: &str, value: &Json) -> Option<Property> {
+pub(crate) fn text_param(key: &str, value: &Json) -> Option<Property> {
     let value = match value {
         Json::Bool(b) => Value::Bool(*b),
         Json::Number(n) if n.is_i64() => Value::Int(n.as_i64()?),
@@ -50,7 +50,7 @@ fn text_param(key: &str, value: &Json) -> Option<Property> {
 }
 
 /// Propiedades planas de un objeto JSON (un nivel, con prefijo), sin listas ni objetos.
-fn flat(prefix: &str, object: &Json, out: &mut Vec<Property>) {
+pub(crate) fn flat(prefix: &str, object: &Json, out: &mut Vec<Property>) {
     if let Some(map) = object.as_object() {
         for (k, v) in map {
             let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
@@ -208,3 +208,6 @@ pub fn migrate(from: &Path, to: &Path, template: Option<&Path>, commit: &str) ->
     notes.push(format!("{} tensores, tokenizer y configuración idénticos byte a byte al v9", count));
     Ok(Report { tensors: count as usize, text_bytes: blocks[TEXT].size, identity, notes })
 }
+
+/// Propiedades planas de un registro JSON (para `hnf10 seal`).
+pub fn flat_params(json: &Json, out: &mut Vec<Property>) { flat("", json, out) }

@@ -184,3 +184,38 @@ fn validation_catches_structural_errors() {
     experts.tensors[1].experts = 3;
     assert!(experts.validate(offset).unwrap_err().to_string().contains("expertos"));
 }
+
+#[test]
+fn edit_seal_and_repair() {
+    use helios_convert_v10::edit::{begin_edit, repair, seal};
+    let base = temp("edit-base");
+    let md = sample(&base);
+    let moe = md.tensors[1].clone();
+    // Edición completa: los pesos del tensor tocado cambian y el sellado lo deja válido.
+    let to = temp("edit-ok");
+    assert_eq!(begin_edit(&base, &to, "prueba", ".moe.experts.", step::REFINE).unwrap(), 1);
+    assert!(open(&to).is_err());
+    OpenOptions::new().write(true).open(&to).unwrap().write_all_at(&[7u8; 32], moe.offset).unwrap();
+    assert_eq!(seal(&to, vec![], "fnv").unwrap(), 1);
+    let sealed = open(&to).unwrap();
+    assert!(verify_tensors(&to, &sealed.metadata).unwrap().is_empty());
+    assert_ne!(sealed.metadata.tensors[1].hash, moe.hash);
+    assert_eq!(sealed.metadata.provenance.last().unwrap().state, step::COMPLETE);
+    assert_ne!(sealed.header.identity, open(&base).unwrap().header.identity);
+    // Un tensor que no estaba en la edición no puede cambiar.
+    let to = temp("edit-ajeno");
+    begin_edit(&base, &to, "prueba", ".moe.experts.", step::REFINE).unwrap();
+    OpenOptions::new().write(true).open(&to).unwrap().write_all_at(&[7u8; 8], md.tensors[0].offset).unwrap();
+    assert!(seal(&to, vec![], "").unwrap_err().to_string().contains("sin estar entre"));
+    // Corte sin tocar pesos: la reparación cancela el paso y el fichero vuelve a abrirse.
+    let to = temp("edit-cancel");
+    begin_edit(&base, &to, "prueba", ".moe.experts.", step::REFINE).unwrap();
+    repair(&to).unwrap();
+    assert_eq!(open(&to).unwrap().metadata.provenance.last().unwrap().state, step::CANCELLED);
+    // Corte con pesos ya escritos: no se puede volver atrás.
+    let to = temp("edit-medias");
+    begin_edit(&base, &to, "prueba", ".moe.experts.", step::REFINE).unwrap();
+    OpenOptions::new().write(true).open(&to).unwrap().write_all_at(&[9u8; 16], moe.offset).unwrap();
+    assert!(repair(&to).is_err());
+    assert!(open(&to).is_err());
+}

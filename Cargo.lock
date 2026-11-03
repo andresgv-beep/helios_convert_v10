@@ -344,6 +344,7 @@ dependencies = [
  "crc32fast",
  "helios-convert",
  "memmap2",
+ "rayon",
  "serde_json",
  "xxhash-rust",
 ]
