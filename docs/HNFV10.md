@@ -192,3 +192,39 @@ un plan de reserva. De las 37 claves de `text`:
 Antes de que el migrador dé por buena la configuración hay que comprobar que, para las 15
 claves repetidas, el valor del binario coincide con el del JSON. Si no coinciden, hoy manda el
 JSON, y esa es la configuración efectiva que el HNFv10 tiene que reproducir.
+
+## 12. Primera migración: Gemma 4 26B refinado (2026-11-03)
+
+Migrado con `hnf10 migrate`, desde el HNFv9 sellado que cargaba HEXOS
+(`gemma4-26b-moe-dense-hq8-hector-refined`), en 1,5 minutos.
+
+- **Configuración:** la configuración de texto que regenera `TextModelConfigBin::from_json`
+  desde el JSON coincide byte a byte con la de `TNIH`, y los flags de modalidad coinciden.
+  `final_logit_softcapping` pasa a propiedad tipada de la configuración (30).
+- **Pesos:** los 657 tensores, el tokenizer y la configuración son idénticos byte a byte al v9.
+  `hnf10 verify` recalcula todos los hashes en 14 s.
+- **Plantilla:** `chat_template.jinja` entra como componente opcional, con sus 18.683 bytes.
+- **Procedencia:** cinco pasos. Conversión, captura de importancia, refinado y sellado salen
+  del manifiesto v9; el último es la migración.
+- **Motor:** Héctor lee HNFv10 (`src/hnf10.cpp`).
+  - `helios_model_probe` da la misma salida con el v9 y con el v10.
+  - `hnf_config_dump` muestra la configuración efectiva. Solo difieren:
+    - las claves que solo traía el JSON y que el motor no lee;
+    - `mlp_activation`: `gelu_new` en v9, porque el JSON se aplicaba encima, y `gelu` en v10,
+      porque `TNIH` no distingue las dos. El motor envía las dos al mismo kernel `add_gelu`.
+      Si algún modelo necesita la `gelu` exacta, hará falta un campo en `TNIH`.
+  - **Regresión de logits:** 5 casos del conjunto final, unos 646 MB de logits, idénticos bit a
+    bit entre v9 y v10 con el mismo `tune.cache`.
+- HEXOS carga el HNFv10 desde el 2026-11-03:
+  `helios_convert_v10/output/gemma4-26b-moe-dense-hq8-gptq.v10.hnf`, con su `.sha256`.
+
+Pendiente:
+- Revisión de GPT (2026-11-03) corregida: las confirmaciones van en una `Session` con cerrojo exclusivo
+  y comprueban en disco la secuencia vigente; cada tensor debe estar en exactamente un rango de
+  componente y dentro de la zona de payloads; las fórmulas de memoria se validan (variables, exponentes,
+  coeficientes y máximos). Lo mismo en el lector del motor.
+- `hnf_refine` y `hnf-seal` siguen escribiendo HNFv9; falta pasarlos a v10 con los pasos
+  «en curso» y «completo».
+- El conversor de safetensors a HNFv10 directo.
+- Las fórmulas de memoria y el reparto de GPUs con visión.
+- Regenerar los HNF de prueba del motor.

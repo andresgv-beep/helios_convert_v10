@@ -1,6 +1,6 @@
 //! Contenedor HNFv10: ida y vuelta, cortes simulados, estado «en curso» y validación.
-use helios_convert_v10::file::{commit, open, open_for_repair, verify_tensors, Builder};
-use helios_convert_v10::format::{State, HEADER_SIZE};
+use helios_convert_v10::file::{open, open_for_repair, verify_tensors, Builder, Session};
+use helios_convert_v10::format::{Header, State, HEADER_SIZE};
 use helios_convert_v10::metadata::{kind, step, Component, Metadata, MemoryFormula, Property, Step, Tensor, Value};
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
@@ -68,7 +68,7 @@ fn commit_switches_slot_and_falls_back_on_damage() {
     let mut sealed = md.clone();
     sealed.provenance.push(Step { kind: step::SEAL, state: step::COMPLETE, tool: "seal".into(), version: "0".into(), commit: "-".into(),
         input: first.header.identity, output: first.header.identity, calibration: String::new(), touched: vec![], params: vec![] });
-    commit(&path, &first, sealed.clone(), State::Complete).unwrap();
+    Session::begin(&path).unwrap().commit(sealed.clone(), State::Complete).unwrap();
     let second = open(&path).unwrap();
     assert_eq!((second.slot, second.header.sequence), (1, 2));
     assert_eq!(second.metadata.provenance.len(), 2);
@@ -85,7 +85,8 @@ fn commit_switches_slot_and_falls_back_on_damage() {
     let path = temp("cortados");
     let md = sample(&path);
     let first = open(&path).unwrap();
-    commit(&path, &first, md.clone(), State::Complete).unwrap();
+    let _ = first;
+    Session::begin(&path).unwrap().commit(md.clone(), State::Complete).unwrap();
     let len = std::fs::metadata(&path).unwrap().len();
     OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 10).unwrap();
     assert_eq!(open(&path).unwrap().header.sequence, 1);
@@ -100,12 +101,46 @@ fn in_progress_rejects_even_with_an_older_complete_header() {
     pending.provenance.push(Step { kind: step::REFINE, state: step::IN_PROGRESS, tool: "hnf_refine".into(), version: "0".into(),
         commit: "-".into(), input: first.header.identity, output: [0; 16], calibration: "fnv".into(),
         touched: vec![md.tensors[1].name.clone()], params: vec![] });
-    commit(&path, &first, pending, State::InProgress).unwrap();
+    Session::begin(&path).unwrap().commit(pending, State::InProgress).unwrap();
     let error = open(&path).err().unwrap().to_string();
     assert!(error.contains("en curso"), "{error}");
     let (newest, previous) = open_for_repair(&path).unwrap();
     assert_eq!(newest.header.state, State::InProgress);
     assert_eq!(previous.unwrap().header.state, State::Complete);
+    // Una sesión normal no puede empezar sobre un «en curso»; solo la de reparación, que
+    // parte de la cabecera vigente y es la única que puede cerrarlo.
+    assert!(Session::begin(&path).err().unwrap().to_string().contains("en curso"));
+    let mut repair = Session::begin_repair(&path).unwrap();
+    assert_eq!(repair.current().header.sequence, 2);
+    repair.commit(md.clone(), State::Complete).unwrap();
+    assert_eq!(open(&path).unwrap().header.sequence, 3);
+}
+
+/// Hallazgo de GPT: una confirmación hecha con un estado antiguo tapaba un «en curso».
+#[test]
+fn stale_or_concurrent_commits_are_rejected() {
+    let path = temp("antigua");
+    let md = sample(&path);
+    // Dos sesiones a la vez: la segunda no consigue el cerrojo.
+    let mut writer = Session::begin(&path).unwrap();
+    assert!(Session::begin(&path).err().unwrap().to_string().contains("otro proceso"));
+    // Alguien que se salta el cerrojo deja una cabecera más nueva: la sesión lo detecta.
+    let current = writer.current().header.clone();
+    let newer = Header { sequence: current.sequence + 5, ..current };
+    OpenOptions::new().write(true).open(&path).unwrap().write_all_at(&newer.to_bytes(), HEADER_SIZE as u64).unwrap();
+    let error = writer.commit(md.clone(), State::Complete).err().unwrap().to_string();
+    assert!(error.contains("ya no es la de esta sesión"), "{error}");
+    drop(writer);
+
+    // El caso reproducido: «en curso», pesos a medias y luego cerrar con el estado viejo.
+    let path = temp("encurso-antigua");
+    let md = sample(&path);
+    let mut refine = Session::begin(&path).unwrap();
+    refine.commit(md.clone(), State::InProgress).unwrap();
+    refine.file().write_all_at(&[0xAB; 64], md.tensors[1].offset).unwrap();
+    drop(refine);                                   // corte antes de cerrar
+    assert!(open(&path).is_err());
+    assert!(Session::begin(&path).is_err());        // nadie confirma encima con el estado viejo
 }
 
 #[test]
@@ -125,6 +160,26 @@ fn validation_catches_structural_errors() {
     assert!(unknown.validate(offset).is_err());
     unknown.components[1].required = false;
     assert!(unknown.validate(offset).is_ok());
+    // Hallazgo de GPT: un tensor fuera de todo rango de componente y fuera del fichero.
+    let mut orphan = md.clone();
+    let mut extra = md.tensors[0].clone();
+    extra.name = "huérfano".into();
+    extra.offset = 1 << 40;
+    orphan.tensors.push(extra);
+    assert!(orphan.validate(offset).unwrap_err().to_string().contains("rangos"));
+    let mut twice = md.clone();
+    twice.components[1].first_tensor = 0;
+    twice.components[1].tensor_count = 1;
+    assert!(twice.validate(offset).is_err());
+    // Hallazgo de GPT: fórmulas de memoria sin validar.
+    for bad in [vec![(1, 1, f64::NAN)], vec![(1, 1, -1.0)], vec![(9, 1, 1.0)], vec![(2, 1, 1.0)], vec![(1, 7, 1.0)]] {
+        let mut memory = md.clone();
+        memory.memory[0].terms = bad.clone();
+        assert!(memory.validate(offset).is_err(), "{bad:?}");
+    }
+    let mut zero = md.clone();
+    zero.memory[0].maxima.push((1, 5));
+    assert!(zero.validate(offset).unwrap_err().to_string().contains("repetido"));
     let mut experts = md.clone();
     experts.tensors[1].experts = 3;
     assert!(experts.validate(offset).unwrap_err().to_string().contains("expertos"));

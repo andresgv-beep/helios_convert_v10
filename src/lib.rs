@@ -2,3 +2,4 @@
 pub mod format;
 pub mod metadata;
 pub mod file;
+pub mod migrate;

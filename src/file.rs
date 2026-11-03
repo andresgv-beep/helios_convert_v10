@@ -3,7 +3,7 @@ use crate::format::{align_up, choose, xxh3_128, Header, State, ALIGN, HEADER_SIZ
 use crate::metadata::Metadata;
 use anyhow::{ensure, Context, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -118,47 +118,91 @@ impl Write for Hashing<'_> {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
-/// Confirma metadatos nuevos: los escribe al final, `fsync`, y después la cabecera que
-/// no manda, con secuencia + 1 y el estado dado, `fsync` (§2).
-pub fn commit(path: &Path, current: &Opened, mut metadata: Metadata, state: State) -> Result<Header> {
-    for i in 0..metadata.components.len() {
-        let composite = metadata.composite(&metadata.components[i]);
-        metadata.components[i].composite = composite;
-    }
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
+/// Todas las cabeceras válidas (CRC, metadatos completos y con su hash), la más reciente
+/// primero, incluidas las que dicen «en curso».
+fn valid_headers(file: &File) -> Result<Vec<Opened>> {
     let len = file.metadata()?.len();
-    let offset = align_up(len.max(current.header.file_size), ALIGN);
-    metadata.validate(offset)?;
-    let bytes = metadata.encode();
-    let mut padded = vec![0u8; (offset - len) as usize];
-    padded.extend_from_slice(&bytes);
-    file.write_all_at(&padded, len)?;
-    file.sync_all()?;
-    let header = Header { sequence: current.header.sequence + 1, state, metadata_offset: offset, metadata_size: bytes.len() as u64,
-        metadata_hash: xxh3_128(&bytes), file_size: offset + bytes.len() as u64, identity: metadata.identity() };
-    let target = 1 - current.slot;
-    file.write_all_at(&header.to_bytes(), (target * HEADER_SIZE) as u64)?;
-    file.sync_all()?;
-    Ok(header)
-}
-
-/// Lee un HNFv10 aunque su última cabecera diga «en curso»: solo para reparar.
-pub fn open_for_repair(path: &Path) -> Result<(Opened, Option<Opened>)> {
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let mut slots = [vec![0u8; HEADER_SIZE], vec![0u8; HEADER_SIZE]];
-    file.read_exact(&mut slots[0])?;
-    file.read_exact(&mut slots[1])?;
+    let slots = read_slots(file)?;
     let mut valid = Vec::new();
     for (slot, bytes) in slots.iter().enumerate() {
         let Ok(header) = Header::from_bytes(bytes) else { continue };
-        let Some(meta) = metadata_bytes(&file, len, &header) else { continue };
+        if header.file_size > len { continue; }
+        let Some(meta) = metadata_bytes(file, len, &header) else { continue };
         if xxh3_128(&meta) != header.metadata_hash { continue; }
         let Ok(metadata) = Metadata::decode(&meta) else { continue };
         valid.push(Opened { slot, header, metadata });
     }
     valid.sort_by_key(|o| std::cmp::Reverse(o.header.sequence));
-    let mut it = valid.into_iter();
+    Ok(valid)
+}
+
+/// Lee un HNFv10 aunque su última cabecera diga «en curso»: solo para reparar.
+pub fn open_for_repair(path: &Path) -> Result<(Opened, Option<Opened>)> {
+    let file = File::open(path)?;
+    let mut it = valid_headers(&file)?.into_iter();
     let newest = it.next().context("ninguna cabecera válida")?;
     Ok((newest, it.next()))
+}
+
+/// Sesión de escritura sobre un HNFv10: cerrojo exclusivo del fichero mientras dure (una
+/// modificación de pesos es «en curso», pesos y cierre, todo en la misma sesión) y cada
+/// confirmación comprueba en disco que la cabecera vigente es la que la sesión espera.
+/// Así una confirmación hecha con un estado antiguo no puede tapar un «en curso».
+pub struct Session {
+    file: File,
+    current: Opened,
+}
+
+impl Session {
+    /// Para sellar o refinar: el fichero tiene que estar completo.
+    pub fn begin(path: &Path) -> Result<Self> {
+        let session = Self::lock(path)?;
+        ensure!(session.current.header.state == State::Complete,
+            "la última escritura de pesos quedó en curso: el fichero no es fiable hasta repararlo (hnf10 repair)");
+        Ok(session)
+    }
+
+    /// Para reparar: admite que la cabecera vigente diga «en curso».
+    pub fn begin_repair(path: &Path) -> Result<Self> { Self::lock(path) }
+
+    fn lock(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("no abro {}", path.display()))?;
+        file.try_lock().map_err(|_| anyhow::anyhow!("otro proceso está escribiendo en {}", path.display()))?;
+        let current = valid_headers(&file)?.into_iter().next().context("ninguna cabecera válida")?;
+        Ok(Session { file, current })
+    }
+
+    pub fn current(&self) -> &Opened { &self.current }
+
+    /// El fichero, para escribir pesos entre la confirmación «en curso» y la de cierre.
+    pub fn file(&self) -> &File { &self.file }
+
+    /// Escribe los metadatos al final, `fsync`, y después la cabecera que no manda, con
+    /// secuencia + 1 y el estado dado, `fsync` (§2).
+    pub fn commit(&mut self, mut metadata: Metadata, state: State) -> Result<&Opened> {
+        let on_disk = valid_headers(&self.file)?.into_iter().next().context("ninguna cabecera válida")?;
+        ensure!(on_disk.header.sequence == self.current.header.sequence && on_disk.slot == self.current.slot,
+            "la cabecera vigente ya no es la de esta sesión (secuencia {} en disco, {} esperada): confirmación rechazada",
+            on_disk.header.sequence, self.current.header.sequence);
+        for i in 0..metadata.components.len() {
+            let composite = metadata.composite(&metadata.components[i]);
+            metadata.components[i].composite = composite;
+        }
+        let len = self.file.metadata()?.len();
+        let offset = align_up(len.max(self.current.header.file_size), ALIGN);
+        metadata.validate(offset)?;
+        let bytes = metadata.encode();
+        let mut padded = vec![0u8; (offset - len) as usize];
+        padded.extend_from_slice(&bytes);
+        self.file.write_all_at(&padded, len)?;
+        self.file.sync_all()?;
+        let header = Header { sequence: self.current.header.sequence + 1, state, metadata_offset: offset,
+            metadata_size: bytes.len() as u64, metadata_hash: xxh3_128(&bytes), file_size: offset + bytes.len() as u64,
+            identity: metadata.identity() };
+        let target = 1 - self.current.slot;
+        self.file.write_all_at(&header.to_bytes(), (target * HEADER_SIZE) as u64)?;
+        self.file.sync_all()?;
+        self.current = Opened { slot: target, header, metadata };
+        Ok(&self.current)
+    }
 }

@@ -325,6 +325,34 @@ impl Metadata {
         }
         ranges.sort();
         for w in ranges.windows(2) { ensure!(w[0].1 <= w[1].0, "{} y {} se solapan", w[0].2, w[1].2); }
+        // Cada tensor, en exactamente un rango de componente y dentro de la zona de payloads.
+        let mut owners = vec![0u32; self.tensors.len()];
+        for c in &self.components {
+            for owner in &mut owners[c.first_tensor as usize..(c.first_tensor + c.tensor_count) as usize] { *owner += 1; }
+        }
+        if let Some(i) = owners.iter().position(|&n| n != 1) {
+            bail!("el tensor {} está en {} rangos de componente: debe estar en uno", self.tensors[i].name, owners[i]);
+        }
+        for t in &self.tensors {
+            let end = t.offset.checked_add(t.size).context("tensor desbordado")?;
+            ensure!(t.offset >= PAYLOAD_START && end <= metadata_offset, "{} fuera de la zona de payloads", t.name);
+        }
+        // Fórmulas de memoria: variables conocidas, exponentes 1–3, coeficientes finitos y no
+        // negativos, y un máximo para cada variable que se use.
+        for (i, f) in self.memory.iter().enumerate() {
+            let mut maxima = BTreeSet::new();
+            for (v, max) in &f.maxima {
+                ensure!((1..=4).contains(v), "fórmula {i}: variable desconocida {v}");
+                ensure!(*max > 0, "fórmula {i}: máximo nulo para la variable {v}");
+                ensure!(maxima.insert(*v), "fórmula {i}: máximo repetido para la variable {v}");
+            }
+            for (v, power, coefficient) in &f.terms {
+                ensure!((1..=4).contains(v), "fórmula {i}: variable desconocida {v}");
+                ensure!((1..=3).contains(power), "fórmula {i}: exponente {power} no admitido");
+                ensure!(coefficient.is_finite() && *coefficient >= 0.0, "fórmula {i}: coeficiente {coefficient} no válido");
+                ensure!(maxima.contains(v), "fórmula {i}: la variable {v} no declara su máximo");
+            }
+        }
         let mut tensors: Vec<_> = self.tensors.iter().map(|t| (t.offset, t.offset + t.size, &t.name)).collect();
         tensors.sort();
         for w in tensors.windows(2) { ensure!(w[0].1 <= w[1].0, "{} y {} se solapan", w[0].2, w[1].2); }
