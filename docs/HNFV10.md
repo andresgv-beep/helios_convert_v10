@@ -425,19 +425,12 @@ con `<bos>`), puntuadas por verosimilitud con `tools/quant_bench/logprob_secuenc
 | modelo | PIQA acc | acc_norm | acierto con el oficial |
 |---|---:|---:|---:|
 | HQS compacto + importancia | 76,17 % | 76,82 % | 91,8 % |
-<<<<<<< HEAD
 | HQS compacto + importancia, embedding HQ52K | 76,22 % | 77,04 % | 91,5 % |
-=======
->>>>>>> 274e36ff3316a7c30b28c381d91432706263b6a4
 | HQS compacto, atención y embedding HQ52K | 76,01 % | 76,71 % | 89,0 % |
 | Q4_K_M de Unsloth | 76,28 % | 75,68 % | 86,1 % |
 | original en bf16, sin cuantizar (100 preg.) | 76,00 % | 78,00 % | — |
 
-<<<<<<< HEAD
 **Empatan los cinco**, incluido el original sin cuantizar: 0,27 puntos entre el mejor y el peor en
-=======
-**Empatan los cuatro**, incluido el original sin cuantizar: 0,27 puntos entre el mejor y el peor en
->>>>>>> 274e36ff3316a7c30b28c381d91432706263b6a4
 `acc`, sobre los 5,7 puntos que los separan con el árbitro oficial. Un banco que no distingue bf16
 de 4,7 bits no puede guiar un reparto de bits. Las cifras publicadas de PIQA de terceros tampoco
 sirven de ancla: con este arnés el original da 76 % donde una ficha de Hugging Face daba 86,02 %, y
