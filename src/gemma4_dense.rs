@@ -35,6 +35,9 @@ pub struct Options<'a> {
     pub ple: Ple,
     pub vision: bool,
     pub commit: &'a str,
+    /// Directorio con la importancia por columna de los `mlp.down`, como el del v9.1
+    /// (`data/hqs_v4/importance-down-e4b`). Sin él, el HQ44 va con importancia 1.
+    pub importancia: Option<&'a Path>,
 }
 
 const TENSOR_ALIGN: u64 = 4096;
@@ -65,6 +68,17 @@ fn storage(profile: Profile, ple: Ple, canonical: &str, hint: QuantHint, shape: 
     match ple { Ple::DelPerfil => del_perfil, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }
 }
 
+/// Importancia por columna de `<dir>/<canónico>.f32`, la convención del v9.1: solo la tienen
+/// los `mlp.down`, un f32 por columna de entrada. Vacía para todo lo demás.
+fn importancia(dir: Option<&Path>, canonical: &str, cols: usize) -> Result<Vec<f32>> {
+    let Some(dir) = dir else { return Ok(Vec::new()) };
+    if !canonical.ends_with(".mlp.down.weight") { return Ok(Vec::new()); }
+    let path = dir.join(format!("{canonical}.f32"));
+    let bytes = std::fs::read(&path).with_context(|| format!("falta la importancia {}", path.display()))?;
+    ensure!(bytes.len() == cols * 4, "{canonical}: la importancia trae {} bytes y se esperan {}", bytes.len(), cols * 4);
+    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
 fn stored_bytes(dtype: &str, elements: u64) -> u64 {
     match dtype {
         "hq8k" => crate::hqs::hq8k_size(elements as usize) as u64,
@@ -74,7 +88,7 @@ fn stored_bytes(dtype: &str, elements: u64) -> u64 {
     }
 }
 
-fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<()> {
+fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str, imp: &[f32]) -> Result<()> {
     let elements: usize = t.shape.iter().product();
     let width = if dtype == "F32" { 4 } else { 2 };
     ensure!(raw.len() == elements * width, "{}: bytes de origen que no cuadran", t.canonical);
@@ -89,8 +103,8 @@ fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<()> {
         } else if t.dtype == "hq52k" {
             w.write_all(&crate::hqs::quantize_hq52k(&values))?;
         } else if t.dtype == crate::hqs::v4::DTYPE {
-            // Sin calibrar: importancia 1 en todas las columnas.
-            w.write_all(&crate::hqs::v4::quantize(&values, row, &[])?)?;
+            // `imp` vacía = importancia 1 en todas las columnas, que es como queda sin calibrar.
+            w.write_all(&crate::hqs::v4::quantize(&values, row, imp)?)?;
         } else {
             let mut bytes = Vec::with_capacity(values.len() * 2);
             for v in values {
@@ -164,7 +178,8 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
             let info = reader.tensor_info(&t.source).unwrap();
             let raw = reader.read_raw(&t.source)?;
             let mut hashing = Hashing { inner: &mut *w, state: xxhash_rust::xxh3::Xxh3::new(), written: 0 };
-            emit(&mut hashing, t, raw, &info.dtype)?;
+            let imp = importancia(o.importancia, &t.canonical, *t.shape.last().context("forma vacía")?)?;
+            emit(&mut hashing, t, raw, &info.dtype, &imp)?;
             ensure!(hashing.written == t.bytes, "{}: {} bytes escritos, {} previstos", t.canonical, hashing.written, t.bytes);
             hashes.push((hashing.state.digest128().to_le_bytes(), xxhash_rust::xxh3::xxh3_64(raw)));
             written = at + t.bytes;
@@ -210,7 +225,9 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         Property { key: "ple".into(), value: Value::Str(match o.ple { Ple::DelPerfil => "del perfil", Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }.into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
-        Property { key: "calibration".into(), value: Value::Str("none".into()) },
+        Property { key: "calibration".into(), value: Value::Str(match o.importancia {
+            Some(d) => d.file_name().map_or_else(|| d.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            None => "none".into() }) },
     ];
     if let Some(w) = &written {
         params.push(Property { key: "vision_fp16_inexact_values".into(), value: Value::Int(w.inexact as i64) });

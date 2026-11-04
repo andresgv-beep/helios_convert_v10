@@ -336,3 +336,31 @@ admite rango 0. El audio todavía no se convierte: el motor no tiene adaptador d
   imágenes.
 - Frente a transformers en CPU (BF16), en 16 posiciones de 4 documentos del conjunto de
   evaluación: **KL media 0,0017** (máxima 0,0063) y el mismo argmax en las 16.
+
+### Formato por pieza y calibración (2026-11-04)
+
+`--ple hq44|hq52|hq8k` elige el formato de la tabla PLE aparte del perfil, e `--importance <dir>`
+vale ya en el denso: toma la importancia por columna de cada `mlp.down` de `<dir>/<canónico>.f32`
+—la convención del v9.1, con sus `data/hqs_v4/importance-down-e4b`—, comprueba que trae un f32 por
+columna y la anota en la propiedad `calibration`. Sin `--importance`, el HQ44 va con importancia 1
+en todas las columnas, que es como se convirtió el compacto del 3/11.
+
+Medido en la RTX 5070 Laptop de 8 GB contra transformers 5.15 (bf16, CPU) con el banco de Héctor:
+`corpus_narrativa` + `corpus_tecnico`, 1.505 posiciones precedidas de `<bos>`. Sin el `<bos>` los
+dos lados ven contextos distintos y la medida no vale (README del banco, regla 3).
+
+| E4B | Tamaño | Coincide con el oficial | McNemar |
+|---|---:|---:|---|
+| v9.1 HQS v4 (hq53k + MLP HQ44) | 5,14 GB | 85,2 % | — |
+| compacto (HQ8K + MLP y PLE HQ44) | 5,47 GB | 89,8 % | p = 3,2e-07 frente al v9.1 |
+| compacto con la PLE en HQ52 | 5,82 GB | 90,4 % | p = 0,064 frente al compacto, no concluyente |
+| **compacto + importancia** | **5,47 GB** | **91,8 %** | **p = 0,0027 frente al compacto** |
+
+Dos conclusiones. La PLE no era el punto flojo: 0,35 GB por 0,6 puntos que no se sostienen. Y la
+importancia da 2,0 puntos **sin cambiar un byte de pesos** (el fichero crece 110 bytes, que son las
+propiedades nuevas del manifiesto). Por corpus suelto el efecto es el mismo en los dos —narrativa
+89,6 → 91,7 y técnico 90,0 → 92,0— pero con la mitad de posiciones no llega a p < 0,01 en ninguno:
+la dirección está confirmada dos veces, la significancia solo en el conjunto.
+
+El corpus de evaluación que se amplíe no puede salir del README de hexos-core: la importancia del
+E4B se calibró con sus primeros 2.600 caracteres (`data/hqs_v4/README.md` del v9.1).

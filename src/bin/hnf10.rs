@@ -44,7 +44,8 @@ enum Command {
         #[arg(long)] ple: Option<String>,
         /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
         #[arg(long)] dense_hq8: bool,
-        /// Importancia HQ44 por experto (layerN.gate_up.f32 y layerN.down.f32).
+        /// Importancia HQ44: por experto en el MoE (layerN.gate_up.f32 y layerN.down.f32), y por
+        /// columna de cada mlp.down en el denso (text.layerN.mlp.down.weight.f32).
         #[arg(long)] importance: Option<PathBuf>,
         #[arg(long, default_value = "")] commit: String,
         #[arg(long, default_value_t = 10)] threads: usize,
@@ -112,7 +113,7 @@ fn main() -> Result<()> {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["text_config"]["enable_moe_block"] != true {
-                anyhow::ensure!(!dense_hq8 && importance.is_none(), "--dense-hq8 e --importance son del MoE; el denso ya va en HQ8K");
+                anyhow::ensure!(!dense_hq8, "--dense-hq8 es del MoE; el denso ya va en HQ8K");
                 let tabla_ple = match ple.as_deref() {
                     None | Some("hq44") => helios_convert_v10::gemma4_dense::Ple::DelPerfil,
                     Some("hq52") => helios_convert_v10::gemma4_dense::Ple::Hq52,
@@ -121,6 +122,7 @@ fn main() -> Result<()> {
                 };
                 let identity = helios_convert_v10::gemma4_dense::convert(&helios_convert_v10::gemma4_dense::Options {
                     model: &model, out: &out, vision, commit: &commit, ple: tabla_ple,
+                    importancia: importance.as_deref(),
                     profile: if compacto { helios_convert_v10::gemma4_dense::Profile::Compacto } else { helios_convert_v10::gemma4_dense::Profile::Q8 } })?;
                 println!("listo: {}, identidad {}", out.display(), hex(&identity));
                 return Ok(());
