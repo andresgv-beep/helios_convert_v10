@@ -364,3 +364,76 @@ la dirección está confirmada dos veces, la significancia solo en el conjunto.
 
 El corpus de evaluación que se amplíe no puede salir del README de hexos-core: la importancia del
 E4B se calibró con sus primeros 2.600 caracteres (`data/hqs_v4/README.md` del v9.1).
+
+### Reparto por pieza, y dos varas que no sirven (2026-11-04)
+
+`--embedding` y `--atencion` bajan a HQ52K las piezas que el perfil deja en HQ8K. Medido con el
+mismo banco (1.505 posiciones, árbitro oficial), partiendo del compacto calibrado:
+
+| cambio | texto | total | acierto | McNemar frente al calibrado |
+|---|---:|---:|---:|---|
+| ninguno (compacto + importancia) | 5,12 GB | 5,46 GB | 91,8 % | — |
+| embedding a HQ52K | 4,89 GB | 5,23 GB | 91,5 % | p = 0,18, **no concluyente** |
+| atención a HQ52K | 4,93 GB | 5,27 GB | 88,6 % | p = 2,8e-07 |
+| las dos | 4,67 GB | 5,01 GB | 89,0 % | p = 4,3e-06 |
+
+**El embedding aguanta el recorte y la atención no.** 0,23 GB por 0,3 puntos que no se sostienen,
+frente a 0,19 GB por 3,2 puntos que sí. Es la tercera confirmación de la regla del 26B —atención y
+MLP compartida no bajan de 8 bits— y explica el salto del v9.1 al compacto.
+
+#### Frente al Q4_K_M de Unsloth
+
+Sus pesos dequantizados con `gguf.dequantize`, pasados a safetensors y convertidos con el perfil q8,
+corren en Héctor y se miden con el mismo árbitro: así se mide **su cuantización** sin heredar su
+inferencia, que en Gemma 4 pierde un 12 % ya sin cuantizar (README de `quant_bench`). Encima lleva
+nuestro HQ8K (0,56 %), que le perjudica poco y en su contra.
+
+| modelo | texto | visión | total | acierto |
+|---|---:|---:|---:|---:|
+| HQS compacto, atención y embedding HQ52K | 4,67 GB | 0,34 GB | **5,01 GB** | **89,0 %** |
+| Q4_K_M + `mmproj-F16` | 4,98 GB | 0,99 GB | 5,97 GB | 86,1 % |
+
+A igual presupuesto de texto les saca 2,9 puntos (p = 0,0030; por corpus, narrativa p = 0,059 y
+técnico p = 0,022, misma dirección). Su reparto es el inverso del nuestro: Q4_K en atención y
+embedding —hasta 9,13 % de error L2 en `layers.23.self_attn.v_proj`—, Q5_K en `ffn_down` y en la
+tabla PLE, Q6_K en las capas de los extremos, y la torre visual sin cuantizar.
+
+#### El L2 de los pesos no predice la calidad
+
+`src/bin/escalones.rs` saca la curva tamaño/error sobre pesos reales. Reproduce la tabla de
+`HQS_FORMATOS.md` y añade HQ31K, que estaba sin medir:
+
+| formato | bits/peso | error L2 |
+|---|---:|---:|
+| HQ31K | 4,25 | ~11,3 % |
+| HQ44 | 4,75 | ~6,0 % |
+| HQ52K | 5,75 | ~3,5 % |
+| HQ62K | 8,25 | ~1,11 % |
+| HQ8K | 8,50 | ~0,56 % |
+
+Dos razones para no usarla como guía del reparto. **El error es el mismo en todos los tensores**
+(6,0 % en la atención y 6,1 % en la tabla PLE con HQ44), así que no distingue la pieza sensible de
+la que no lo es. Y **la calibración empeora el L2**: la importancia sube el `mlp.down` del 6,05 % al
+7,32 % y aun así mejora el modelo 2,0 puntos. Decidir por L2 habría descartado el único cambio
+gratis que funcionó.
+
+#### PIQA tampoco discrimina
+
+1.838 preguntas de validación, formato de lm-eval-harness (`"Question: {goal}\nAnswer:"` + `" {sol}"`
+con `<bos>`), puntuadas por verosimilitud con `tools/quant_bench/logprob_secuencias.cu` de Héctor:
+
+| modelo | PIQA acc | acc_norm | acierto con el oficial |
+|---|---:|---:|---:|
+| HQS compacto + importancia | 76,17 % | 76,82 % | 91,8 % |
+| HQS compacto, atención y embedding HQ52K | 76,01 % | 76,71 % | 89,0 % |
+| Q4_K_M de Unsloth | 76,28 % | 75,68 % | 86,1 % |
+| original en bf16, sin cuantizar (100 preg.) | 76,00 % | 78,00 % | — |
+
+**Empatan los cuatro**, incluido el original sin cuantizar: 0,27 puntos entre el mejor y el peor en
+`acc`, sobre los 5,7 puntos que los separan con el árbitro oficial. Un banco que no distingue bf16
+de 4,7 bits no puede guiar un reparto de bits. Las cifras publicadas de PIQA de terceros tampoco
+sirven de ancla: con este arnés el original da 76 % donde una ficha de Hugging Face daba 86,02 %, y
+el prompt y la normalización mueven eso varios puntos.
+
+El banco completo —ids, árbitro, volcados y guiones— queda en `/home/andres/Documentos/banco-e4b/`
+de la máquina de Andrés. Una variante nueva se puntúa en minuto y medio.
