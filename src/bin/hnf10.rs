@@ -42,6 +42,10 @@ enum Command {
         #[arg(long)] compacto: bool,
         /// Denso: formato de la tabla PLE aparte del perfil: hq44, hq52 o hq8k.
         #[arg(long)] ple: Option<String>,
+        /// Denso: escalón del embedding, hq8k (por defecto) o hq52.
+        #[arg(long)] embedding: Option<String>,
+        /// Denso: escalón de la atención, hq8k (por defecto) o hq52.
+        #[arg(long)] atencion: Option<String>,
         /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
         #[arg(long)] dense_hq8: bool,
         /// Importancia HQ44: por experto en el MoE (layerN.gate_up.f32 y layerN.down.f32), y por
@@ -109,7 +113,7 @@ fn main() -> Result<()> {
                 println!("  paso {} «{}» {} {} params, {} tensores tocados", s.kind, s.tool, s.version, s.params.len(), s.touched.len());
             }
         }
-        Command::Convert { model, out, vision, compacto, ple, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["text_config"]["enable_moe_block"] != true {
@@ -120,14 +124,21 @@ fn main() -> Result<()> {
                     Some("hq8k") => helios_convert_v10::gemma4_dense::Ple::Hq8,
                     Some(otro) => anyhow::bail!("--ple {otro}: solo hq44, hq52 o hq8k"),
                 };
+                let escalon = |v: &Option<String>| match v.as_deref() {
+                    None | Some("hq8k") => Ok(helios_convert_v10::gemma4_dense::Escalon::Hq8),
+                    Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Escalon::Hq52),
+                    Some(otro) => Err(anyhow::anyhow!("{otro}: solo hq8k o hq52")),
+                };
                 let identity = helios_convert_v10::gemma4_dense::convert(&helios_convert_v10::gemma4_dense::Options {
                     model: &model, out: &out, vision, commit: &commit, ple: tabla_ple,
+                    embedding: escalon(&embedding)?, atencion: escalon(&atencion)?,
                     importancia: importance.as_deref(),
                     profile: if compacto { helios_convert_v10::gemma4_dense::Profile::Compacto } else { helios_convert_v10::gemma4_dense::Profile::Q8 } })?;
                 println!("listo: {}, identidad {}", out.display(), hex(&identity));
                 return Ok(());
             }
-            anyhow::ensure!(!vision && !compacto && ple.is_none(), "en el MoE la visión se añade con add-vision y el perfil va con --dense-hq8");
+            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none(),
+                "en el MoE la visión se añade con add-vision y el perfil va con --dense-hq8");
             let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {
                 model: &model, out: &out, dense, importance: importance.as_deref(), commit: &commit, batch_rows: 128 })?;

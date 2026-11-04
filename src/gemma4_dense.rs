@@ -28,11 +28,23 @@ pub enum Profile { Q8, Compacto }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ple { DelPerfil, Hq52, Hq8 }
 
+/// Escalón de las piezas que el perfil deja en HQ8K y se pueden bajar una muesca. El motor
+/// lee HQ52K tanto en matmul como en embedding (`register_kernels.cpp`), y el Q4_K_M de
+/// Unsloth las lleva aún más abajo, así que merece medirse (docs/HQS_FORMATOS.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Escalon { Hq8, Hq52 }
+
+impl Escalon {
+    fn dtype(self) -> &'static str { match self { Escalon::Hq8 => "hq8k", Escalon::Hq52 => "hq52k" } }
+}
+
 pub struct Options<'a> {
     pub model: &'a Path,
     pub out: &'a Path,
     pub profile: Profile,
     pub ple: Ple,
+    pub embedding: Escalon,
+    pub atencion: Escalon,
     pub vision: bool,
     pub commit: &'a str,
     /// Directorio con la importancia por columna de los `mlp.down`, como el del v9.1
@@ -57,15 +69,20 @@ fn source_f32(raw: &[u8], dtype: &str, i: usize) -> f32 {
 /// Cuantizada si la matriz admite superbloques de 256 por fila; si no, FP16. Las normas,
 /// escalares y demás tensores que el mapper pide en FP16 se quedan en FP16, salvo el embedding,
 /// que va en HQ8K como en el 26B. En el compacto, MLP y tabla PLE van en HQ44.
-fn storage(profile: Profile, ple: Ple, canonical: &str, hint: QuantHint, shape: &[usize]) -> &'static str {
+fn storage(o: &Options, canonical: &str, hint: QuantHint, shape: &[usize]) -> &'static str {
     let matrix = shape.len() >= 2 && shape.last().map_or(false, |&c| c % 256 == 0);
     let embedding = canonical == "text.token_embedding.weight";
     if !matrix || (hint == QuantHint::FP16 && !embedding) { return "fp16"; }
     let tabla_ple = canonical == "text.ple.token_embedding.weight";
     let large = canonical.contains(".mlp.") || tabla_ple;
-    let del_perfil = if profile == Profile::Compacto && large { crate::hqs::v4::DTYPE } else { "hq8k" };
-    if !tabla_ple { return del_perfil; }
-    match ple { Ple::DelPerfil => del_perfil, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }
+    let del_perfil = if o.profile == Profile::Compacto && large { crate::hqs::v4::DTYPE } else { "hq8k" };
+    if tabla_ple {
+        return match o.ple { Ple::DelPerfil => del_perfil, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" };
+    }
+    if del_perfil != "hq8k" { return del_perfil; }     // la MLP del compacto
+    if embedding { return o.embedding.dtype(); }
+    if canonical.contains(".attn.") { return o.atencion.dtype(); }
+    del_perfil
 }
 
 /// Importancia por columna de `<dir>/<canónico>.f32`, la convención del v9.1: solo la tienen
@@ -140,7 +157,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         let Some(m) = mapper.map_tensor(name) else { continue };
         ensure!(["BF16", "F16", "F32"].contains(&info.dtype.as_str()), "{name}: dtype {} no admitido", info.dtype);
         let canonical = format!("text.{}", m.canonical_name);
-        let dtype = storage(o.profile, o.ple, &canonical, m.quant_hint, &info.shape);
+        let dtype = storage(o, &canonical, m.quant_hint, &info.shape);
         let elements: u64 = info.shape.iter().map(|&d| d as u64).product();
         let bytes = stored_bytes(dtype, elements);
         plan.push(Planned { canonical, source: name.to_string(), layer: m.layer_idx.map_or(-1, |l| l as i32),
@@ -223,6 +240,8 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     let mut params = vec![
         Property { key: "profile".into(), value: Value::Str(match o.profile { Profile::Q8 => "q8", Profile::Compacto => "compacto" }.into()) },
         Property { key: "ple".into(), value: Value::Str(match o.ple { Ple::DelPerfil => "del perfil", Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }.into()) },
+        Property { key: "embedding".into(), value: Value::Str(o.embedding.dtype().into()) },
+        Property { key: "atencion".into(), value: Value::Str(o.atencion.dtype().into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
         Property { key: "calibration".into(), value: Value::Str(match o.importancia {
