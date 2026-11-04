@@ -244,9 +244,9 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         Property { key: "atencion".into(), value: Value::Str(o.atencion.dtype().into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
+        // La ruta completa, no el nombre: `convert --como` la necesita para rehacer la variante.
         Property { key: "calibration".into(), value: Value::Str(match o.importancia {
-            Some(d) => d.file_name().map_or_else(|| d.display().to_string(), |n| n.to_string_lossy().into_owned()),
-            None => "none".into() }) },
+            Some(d) => d.display().to_string(), None => "none".into() }) },
     ];
     if let Some(w) = &written {
         params.push(Property { key: "vision_fp16_inexact_values".into(), value: Value::Int(w.inexact as i64) });

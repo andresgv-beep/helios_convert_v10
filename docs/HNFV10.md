@@ -425,12 +425,19 @@ con `<bos>`), puntuadas por verosimilitud con `tools/quant_bench/logprob_secuenc
 | modelo | PIQA acc | acc_norm | acierto con el oficial |
 |---|---:|---:|---:|
 | HQS compacto + importancia | 76,17 % | 76,82 % | 91,8 % |
+<<<<<<< HEAD
 | HQS compacto + importancia, embedding HQ52K | 76,22 % | 77,04 % | 91,5 % |
+=======
+>>>>>>> 274e36ff3316a7c30b28c381d91432706263b6a4
 | HQS compacto, atención y embedding HQ52K | 76,01 % | 76,71 % | 89,0 % |
 | Q4_K_M de Unsloth | 76,28 % | 75,68 % | 86,1 % |
 | original en bf16, sin cuantizar (100 preg.) | 76,00 % | 78,00 % | — |
 
+<<<<<<< HEAD
 **Empatan los cinco**, incluido el original sin cuantizar: 0,27 puntos entre el mejor y el peor en
+=======
+**Empatan los cuatro**, incluido el original sin cuantizar: 0,27 puntos entre el mejor y el peor en
+>>>>>>> 274e36ff3316a7c30b28c381d91432706263b6a4
 `acc`, sobre los 5,7 puntos que los separan con el árbitro oficial. Un banco que no distingue bf16
 de 4,7 bits no puede guiar un reparto de bits. Las cifras publicadas de PIQA de terceros tampoco
 sirven de ancla: con este arnés el original da 76 % donde una ficha de Hugging Face daba 86,02 %, y
@@ -438,3 +445,23 @@ el prompt y la normalización mueven eso varios puntos.
 
 El banco completo —ids, árbitro, volcados y guiones— queda en `/home/andres/Documentos/banco-e4b/`
 de la máquina de Andrés. Una variante nueva se puntúa en minuto y medio.
+
+#### Rehacer una variante
+
+`info` lista los parámetros del paso de procedencia, que son la receta: perfil, `ple`, `embedding`,
+`atencion`, `base_id`, `source_model` y `calibration`. Y `convert --como <hnf>` los lee de un HNFv10
+y los reaplica, con los flags explícitos pisando lo que diga el fichero, así que una variante se
+rehace sin acordarse de nada:
+
+```bash
+hnf10 convert --model gemma-4-E4B-it/ --out nuevo.v10.hnf --vision --como viejo.v10.hnf
+```
+
+Comprobado el 2026-11-04: una conversión con los flags a mano y otra con `--como` sobre la primera
+dan el **mismo sha256**. `calibration` guarda ahora la ruta del directorio de importancia y no solo
+su nombre, que sin eso `--como` no puede rehacer una variante calibrada; los HNF anteriores a este
+cambio llevan el nombre y piden `--importance` a mano, con un mensaje que lo dice.
+
+De paso, el campo de identidad demuestra para qué está: el fichero de prueba y el `emb52` convertido
+el día anterior tienen **la misma identidad y distinto sha256**, porque cambió el manifiesto (la
+ruta de calibración, 69 bytes) y no los pesos.

@@ -46,6 +46,9 @@ enum Command {
         #[arg(long)] embedding: Option<String>,
         /// Denso: escalón de la atención, hq8k (por defecto) o hq52.
         #[arg(long)] atencion: Option<String>,
+        /// Denso: copia el perfil, la PLE, los escalones y la calibración de otro HNFv10.
+        /// Lo que se pase a mano manda sobre lo que diga ese fichero.
+        #[arg(long)] como: Option<PathBuf>,
         /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
         #[arg(long)] dense_hq8: bool,
         /// Importancia HQ44: por experto en el MoE (layerN.gate_up.f32 y layerN.down.f32), y por
@@ -111,13 +114,47 @@ fn main() -> Result<()> {
             }
             for s in &o.metadata.provenance {
                 println!("  paso {} «{}» {} {} params, {} tensores tocados", s.kind, s.tool, s.version, s.params.len(), s.touched.len());
+                // La receta: sin esto el fichero sabe como se hizo pero no lo cuenta.
+                for q in &s.params {
+                    let v = match &q.value { Value::Real(x) => x.to_string(), Value::Int(x) => x.to_string(),
+                        Value::Bool(x) => x.to_string(), Value::Str(x) => x.clone(), Value::Bytes(x) => format!("{} bytes", x.len()) };
+                    println!("      {} = {v}", q.key);
+                }
             }
         }
-        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, como, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["text_config"]["enable_moe_block"] != true {
                 anyhow::ensure!(!dense_hq8, "--dense-hq8 es del MoE; el denso ya va en HQ8K");
+                // La receta de otro fichero, si se pide. Los flags explicitos pisan lo que diga.
+                let (mut compacto, mut ple, mut embedding, mut atencion, mut importance) =
+                    (compacto, ple, embedding, atencion, importance);
+                if let Some(ruta) = &como {
+                    let receta = helios_convert_v10::file::open(ruta)?;
+                    let paso = receta.metadata.provenance.first()
+                        .ok_or_else(|| anyhow::anyhow!("{} no tiene procedencia", ruta.display()))?;
+                    let valor = |clave: &str| paso.params.iter().find(|q| q.key == clave)
+                        .and_then(|q| if let helios_convert_v10::metadata::Value::Str(x) = &q.value { Some(x.clone()) } else { None });
+                    match valor("profile").as_deref() {
+                        Some("compacto") => compacto = true,
+                        Some("q8") => compacto = false,
+                        otro => anyhow::bail!("{}: perfil «{}» que no se sabe rehacer", ruta.display(), otro.unwrap_or("ausente")),
+                    }
+                    if ple.is_none() { ple = match valor("ple").as_deref() {
+                        Some("hq52k") => Some("hq52".into()), Some("hq8k") => Some("hq8k".into()), _ => None }; }
+                    if embedding.is_none() { embedding = valor("embedding").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
+                    if atencion.is_none() { atencion = valor("atencion").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
+                    if importance.is_none() {
+                        if let Some(cal) = valor("calibration").filter(|c| c != "none") {
+                            let dir = PathBuf::from(&cal);
+                            anyhow::ensure!(dir.is_dir(), "{} se calibró con «{cal}», que no es un directorio aquí: pásalo con --importance", ruta.display());
+                            importance = Some(dir);
+                        }
+                    }
+                    eprintln!("receta de {}: perfil {}, ple {:?}, embedding {:?}, atencion {:?}, importancia {:?}",
+                              ruta.display(), if compacto { "compacto" } else { "q8" }, ple, embedding, atencion, importance);
+                }
                 let tabla_ple = match ple.as_deref() {
                     None | Some("hq44") => helios_convert_v10::gemma4_dense::Ple::DelPerfil,
                     Some("hq52") => helios_convert_v10::gemma4_dense::Ple::Hq52,
@@ -137,7 +174,7 @@ fn main() -> Result<()> {
                 println!("listo: {}, identidad {}", out.display(), hex(&identity));
                 return Ok(());
             }
-            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none(),
+            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none() && como.is_none(),
                 "en el MoE la visión se añade con add-vision y el perfil va con --dense-hq8");
             let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {
