@@ -46,6 +46,10 @@ enum Command {
         #[arg(long)] embedding: Option<String>,
         /// Denso: escalón de la atención, hq8k (por defecto) o hq52.
         #[arg(long)] atencion: Option<String>,
+        /// Denso: escalón de la MLP entera; por defecto, el del perfil (HQ44 en el compacto).
+        #[arg(long)] mlp: Option<String>,
+        /// Denso: escalón solo del mlp.down; pisa a --mlp para esa matriz.
+        #[arg(long)] mlp_down: Option<String>,
         /// Denso: copia el perfil, la PLE, los escalones y la calibración de otro HNFv10.
         /// Lo que se pase a mano manda sobre lo que diga ese fichero.
         #[arg(long)] como: Option<PathBuf>,
@@ -122,7 +126,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, como, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, mlp, mlp_down, como, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["text_config"]["enable_moe_block"] != true {
@@ -130,6 +134,7 @@ fn main() -> Result<()> {
                 // La receta de otro fichero, si se pide. Los flags explicitos pisan lo que diga.
                 let (mut compacto, mut ple, mut embedding, mut atencion, mut importance) =
                     (compacto, ple, embedding, atencion, importance);
+                let (mut mlp, mut mlp_down) = (mlp, mlp_down);
                 if let Some(ruta) = &como {
                     let receta = helios_convert_v10::file::open(ruta)?;
                     let paso = receta.metadata.provenance.first()
@@ -145,6 +150,8 @@ fn main() -> Result<()> {
                         Some("hq52k") => Some("hq52".into()), Some("hq8k") => Some("hq8k".into()), _ => None }; }
                     if embedding.is_none() { embedding = valor("embedding").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
                     if atencion.is_none() { atencion = valor("atencion").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
+                    if mlp.is_none() { mlp = valor("mlp").filter(|x| x != "del perfil").map(|x| x.trim_end_matches('k').into()); }
+                    if mlp_down.is_none() { mlp_down = valor("mlp_down").filter(|x| x != "del perfil").map(|x| x.trim_end_matches('k').into()); }
                     if importance.is_none() {
                         if let Some(cal) = valor("calibration").filter(|c| c != "none") {
                             let dir = PathBuf::from(&cal);
@@ -166,7 +173,17 @@ fn main() -> Result<()> {
                     Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Escalon::Hq52),
                     Some(otro) => Err(anyhow::anyhow!("{otro}: solo hq8k o hq52")),
                 };
+                let escalon_mlp = |v: &Option<String>| match v.as_deref() {
+                    None => Ok(helios_convert_v10::gemma4_dense::Mlp::DelPerfil),
+                    Some("hq44") => Ok(helios_convert_v10::gemma4_dense::Mlp::DelPerfil),
+                    Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Mlp::Hq52),
+                    Some("hq8k") | Some("hq8") => Ok(helios_convert_v10::gemma4_dense::Mlp::Hq8),
+                    Some(otro) => Err(anyhow::anyhow!("{otro}: solo hq44, hq52 o hq8k")),
+                };
+                let mlp_elegido = escalon_mlp(&mlp)?;
                 let identity = helios_convert_v10::gemma4_dense::convert(&helios_convert_v10::gemma4_dense::Options {
+                    mlp: mlp_elegido,
+                    mlp_down: if mlp_down.is_some() { escalon_mlp(&mlp_down)? } else { mlp_elegido },
                     model: &model, out: &out, vision, commit: &commit, ple: tabla_ple,
                     embedding: escalon(&embedding)?, atencion: escalon(&atencion)?,
                     importancia: importance.as_deref(),
@@ -174,7 +191,8 @@ fn main() -> Result<()> {
                 println!("listo: {}, identidad {}", out.display(), hex(&identity));
                 return Ok(());
             }
-            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none() && como.is_none(),
+            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none()
+                && mlp.is_none() && mlp_down.is_none() && como.is_none(),
                 "en el MoE la visión se añade con add-vision y el perfil va con --dense-hq8");
             let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {

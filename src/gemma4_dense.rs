@@ -38,6 +38,17 @@ impl Escalon {
     fn dtype(self) -> &'static str { match self { Escalon::Hq8 => "hq8k", Escalon::Hq52 => "hq52k" } }
 }
 
+/// Escalón de la MLP, que en el compacto va en HQ44. `down` se elige aparte porque es la
+/// matriz que el Q4_K_M protege con Q5_K y para la que existe la importancia de HQS v4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mlp { DelPerfil, Hq52, Hq8 }
+
+impl Mlp {
+    fn dtype(self, del_perfil: &'static str) -> &'static str {
+        match self { Mlp::DelPerfil => del_perfil, Mlp::Hq52 => "hq52k", Mlp::Hq8 => "hq8k" }
+    }
+}
+
 pub struct Options<'a> {
     pub model: &'a Path,
     pub out: &'a Path,
@@ -45,6 +56,8 @@ pub struct Options<'a> {
     pub ple: Ple,
     pub embedding: Escalon,
     pub atencion: Escalon,
+    pub mlp: Mlp,
+    pub mlp_down: Mlp,
     pub vision: bool,
     pub commit: &'a str,
     /// Directorio con la importancia por columna de los `mlp.down`, como el del v9.1
@@ -79,7 +92,10 @@ fn storage(o: &Options, canonical: &str, hint: QuantHint, shape: &[usize]) -> &'
     if tabla_ple {
         return match o.ple { Ple::DelPerfil => del_perfil, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" };
     }
-    if del_perfil != "hq8k" { return del_perfil; }     // la MLP del compacto
+    if canonical.contains(".mlp.") {
+        let down = canonical.ends_with(".mlp.down.weight");
+        return if down { o.mlp_down.dtype(del_perfil) } else { o.mlp.dtype(del_perfil) };
+    }
     if embedding { return o.embedding.dtype(); }
     if canonical.contains(".attn.") { return o.atencion.dtype(); }
     del_perfil
@@ -242,6 +258,8 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         Property { key: "ple".into(), value: Value::Str(match o.ple { Ple::DelPerfil => "del perfil", Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }.into()) },
         Property { key: "embedding".into(), value: Value::Str(o.embedding.dtype().into()) },
         Property { key: "atencion".into(), value: Value::Str(o.atencion.dtype().into()) },
+        Property { key: "mlp".into(), value: Value::Str(o.mlp.dtype("del perfil").into()) },
+        Property { key: "mlp_down".into(), value: Value::Str(o.mlp_down.dtype("del perfil").into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
         // La ruta completa, no el nombre: `convert --como` la necesita para rehacer la variante.
