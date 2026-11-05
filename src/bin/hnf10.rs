@@ -45,14 +45,14 @@ enum Command {
         /// Denso: escalón del embedding, hq8k (por defecto) o hq52.
         #[arg(long)] embedding: Option<String>,
         /// Denso: escalón de la atención, hq8k (por defecto) o hq52.
-        #[arg(long)] atencion: Option<String>,
+        #[arg(long)] attention: Option<String>,
         /// Denso: escalón de la MLP entera; por defecto, el del perfil (HQ44 en el compacto).
         #[arg(long)] mlp: Option<String>,
         /// Denso: escalón solo del mlp.down; pisa a --mlp para esa matriz.
         #[arg(long)] mlp_down: Option<String>,
         /// Denso: copia el perfil, la PLE, los escalones y la calibración de otro HNFv10.
         /// Lo que se pase a mano manda sobre lo que diga ese fichero.
-        #[arg(long)] como: Option<PathBuf>,
+        #[arg(long)] like: Option<PathBuf>,
         /// Atención, MLP compartida y embedding en HQ8K (perfil compacto); si no, HQ44.
         #[arg(long)] dense_hq8: bool,
         /// Importancia HQ44: por experto en el MoE (layerN.gate_up.f32 y layerN.down.f32), y por
@@ -126,73 +126,76 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Convert { model, out, vision, compacto, ple, embedding, atencion, mlp, mlp_down, como, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, compacto, ple, embedding, attention, mlp, mlp_down, like, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["text_config"]["enable_moe_block"] != true {
                 anyhow::ensure!(!dense_hq8, "--dense-hq8 es del MoE; el denso ya va en HQ8K");
                 // La receta de otro fichero, si se pide. Los flags explicitos pisan lo que diga.
-                let (mut compacto, mut ple, mut embedding, mut atencion, mut importance) =
-                    (compacto, ple, embedding, atencion, importance);
+                let (mut compacto, mut ple, mut embedding, mut attention, mut importance) =
+                    (compacto, ple, embedding, attention, importance);
                 let (mut mlp, mut mlp_down) = (mlp, mlp_down);
-                if let Some(ruta) = &como {
-                    let receta = helios_convert_v10::file::open(ruta)?;
-                    let paso = receta.metadata.provenance.first()
-                        .ok_or_else(|| anyhow::anyhow!("{} no tiene procedencia", ruta.display()))?;
-                    let valor = |clave: &str| paso.params.iter().find(|q| q.key == clave)
+                if let Some(path) = &like {
+                    let recipe = helios_convert_v10::file::open(path)?;
+                    let step = recipe.metadata.provenance.first()
+                        .ok_or_else(|| anyhow::anyhow!("{} no tiene procedencia", path.display()))?;
+                    let value_of = |clave: &str| step.params.iter().find(|q| q.key == clave)
                         .and_then(|q| if let helios_convert_v10::metadata::Value::Str(x) = &q.value { Some(x.clone()) } else { None });
-                    match valor("profile").as_deref() {
+                    match value_of("profile").as_deref() {
                         Some("compacto") => compacto = true,
                         Some("q8") => compacto = false,
-                        otro => anyhow::bail!("{}: perfil «{}» que no se sabe rehacer", ruta.display(), otro.unwrap_or("ausente")),
+                        otro => anyhow::bail!("{}: perfil «{}» que no se sabe rehacer", path.display(), otro.unwrap_or("ausente")),
                     }
-                    if ple.is_none() { ple = match valor("ple").as_deref() {
+                    if ple.is_none() { ple = match value_of("ple").as_deref() {
                         Some("hq52k") => Some("hq52".into()), Some("hq8k") => Some("hq8k".into()), _ => None }; }
-                    if embedding.is_none() { embedding = valor("embedding").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
-                    if atencion.is_none() { atencion = valor("atencion").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
-                    if mlp.is_none() { mlp = valor("mlp").filter(|x| x != "del perfil").map(|x| x.trim_end_matches('k').into()); }
-                    if mlp_down.is_none() { mlp_down = valor("mlp_down").filter(|x| x != "del perfil").map(|x| x.trim_end_matches('k').into()); }
+                    if embedding.is_none() { embedding = value_of("embedding").map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
+                    // «atencion» es la clave que escribieron los HNF de la primera tanda.
+                    if attention.is_none() { attention = value_of("attention").or_else(|| value_of("atencion"))
+                        .map(|x| if x == "hq52k" { "hq52".into() } else { x }); }
+                    let propio = |x: &String| x != "from profile" && x != "del perfil";
+                    if mlp.is_none() { mlp = value_of("mlp").filter(propio).map(|x| x.trim_end_matches('k').into()); }
+                    if mlp_down.is_none() { mlp_down = value_of("mlp_down").filter(propio).map(|x| x.trim_end_matches('k').into()); }
                     if importance.is_none() {
-                        if let Some(cal) = valor("calibration").filter(|c| c != "none") {
+                        if let Some(cal) = value_of("calibration").filter(|c| c != "none") {
                             let dir = PathBuf::from(&cal);
-                            anyhow::ensure!(dir.is_dir(), "{} se calibró con «{cal}», que no es un directorio aquí: pásalo con --importance", ruta.display());
+                            anyhow::ensure!(dir.is_dir(), "{} se calibró con «{cal}», que no es un directorio aquí: pásalo con --importance", path.display());
                             importance = Some(dir);
                         }
                     }
                     eprintln!("receta de {}: perfil {}, ple {:?}, embedding {:?}, atencion {:?}, importancia {:?}",
-                              ruta.display(), if compacto { "compacto" } else { "q8" }, ple, embedding, atencion, importance);
+                              path.display(), if compacto { "compacto" } else { "q8" }, ple, embedding, attention, importance);
                 }
-                let tabla_ple = match ple.as_deref() {
-                    None | Some("hq44") => helios_convert_v10::gemma4_dense::Ple::DelPerfil,
+                let ple_table = match ple.as_deref() {
+                    None | Some("hq44") => helios_convert_v10::gemma4_dense::Ple::FromProfile,
                     Some("hq52") => helios_convert_v10::gemma4_dense::Ple::Hq52,
                     Some("hq8k") => helios_convert_v10::gemma4_dense::Ple::Hq8,
                     Some(otro) => anyhow::bail!("--ple {otro}: solo hq44, hq52 o hq8k"),
                 };
-                let escalon = |v: &Option<String>| match v.as_deref() {
-                    None | Some("hq8k") => Ok(helios_convert_v10::gemma4_dense::Escalon::Hq8),
-                    Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Escalon::Hq52),
+                let level = |v: &Option<String>| match v.as_deref() {
+                    None | Some("hq8k") => Ok(helios_convert_v10::gemma4_dense::Level::Hq8),
+                    Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Level::Hq52),
                     Some(otro) => Err(anyhow::anyhow!("{otro}: solo hq8k o hq52")),
                 };
-                let escalon_mlp = |v: &Option<String>| match v.as_deref() {
-                    None => Ok(helios_convert_v10::gemma4_dense::Mlp::DelPerfil),
-                    Some("hq44") => Ok(helios_convert_v10::gemma4_dense::Mlp::DelPerfil),
+                let mlp_level = |v: &Option<String>| match v.as_deref() {
+                    None => Ok(helios_convert_v10::gemma4_dense::Mlp::FromProfile),
+                    Some("hq44") => Ok(helios_convert_v10::gemma4_dense::Mlp::FromProfile),
                     Some("hq52") => Ok(helios_convert_v10::gemma4_dense::Mlp::Hq52),
                     Some("hq8k") | Some("hq8") => Ok(helios_convert_v10::gemma4_dense::Mlp::Hq8),
                     Some(otro) => Err(anyhow::anyhow!("{otro}: solo hq44, hq52 o hq8k")),
                 };
-                let mlp_elegido = escalon_mlp(&mlp)?;
+                let chosen_mlp = mlp_level(&mlp)?;
                 let identity = helios_convert_v10::gemma4_dense::convert(&helios_convert_v10::gemma4_dense::Options {
-                    mlp: mlp_elegido,
-                    mlp_down: if mlp_down.is_some() { escalon_mlp(&mlp_down)? } else { mlp_elegido },
-                    model: &model, out: &out, vision, commit: &commit, ple: tabla_ple,
-                    embedding: escalon(&embedding)?, atencion: escalon(&atencion)?,
-                    importancia: importance.as_deref(),
+                    mlp: chosen_mlp,
+                    mlp_down: if mlp_down.is_some() { mlp_level(&mlp_down)? } else { chosen_mlp },
+                    model: &model, out: &out, vision, commit: &commit, ple: ple_table,
+                    embedding: level(&embedding)?, attention: level(&attention)?,
+                    importance: importance.as_deref(),
                     profile: if compacto { helios_convert_v10::gemma4_dense::Profile::Compacto } else { helios_convert_v10::gemma4_dense::Profile::Q8 } })?;
                 println!("listo: {}, identidad {}", out.display(), hex(&identity));
                 return Ok(());
             }
-            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && atencion.is_none()
-                && mlp.is_none() && mlp_down.is_none() && como.is_none(),
+            anyhow::ensure!(!vision && !compacto && ple.is_none() && embedding.is_none() && attention.is_none()
+                && mlp.is_none() && mlp_down.is_none() && like.is_none(),
                 "en el MoE la visión se añade con add-vision y el perfil va con --dense-hq8");
             let dense = if dense_hq8 { helios_convert_v10::moe_experimental::DenseFormat::Hq8 } else { helios_convert_v10::moe_experimental::DenseFormat::Hq44 };
             let identity = helios_convert_v10::convert::convert(&helios_convert_v10::convert::Options {

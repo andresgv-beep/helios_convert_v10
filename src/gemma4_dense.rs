@@ -26,26 +26,26 @@ pub enum Profile { Q8, Compacto }
 /// Unsloth le da Q5_K y el v9.1 unos 5,6 bits, así que el HQ44 del compacto puede quedarle
 /// corto (docs/HQS_FORMATOS.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ple { DelPerfil, Hq52, Hq8 }
+pub enum Ple { FromProfile, Hq52, Hq8 }
 
 /// Escalón de las piezas que el perfil deja en HQ8K y se pueden bajar una muesca. El motor
 /// lee HQ52K tanto en matmul como en embedding (`register_kernels.cpp`), y el Q4_K_M de
 /// Unsloth las lleva aún más abajo, así que merece medirse (docs/HQS_FORMATOS.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Escalon { Hq8, Hq52 }
+pub enum Level { Hq8, Hq52 }
 
-impl Escalon {
-    fn dtype(self) -> &'static str { match self { Escalon::Hq8 => "hq8k", Escalon::Hq52 => "hq52k" } }
+impl Level {
+    fn dtype(self) -> &'static str { match self { Level::Hq8 => "hq8k", Level::Hq52 => "hq52k" } }
 }
 
 /// Escalón de la MLP, que en el compacto va en HQ44. `down` se elige aparte porque es la
 /// matriz que el Q4_K_M protege con Q5_K y para la que existe la importancia de HQS v4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mlp { DelPerfil, Hq52, Hq8 }
+pub enum Mlp { FromProfile, Hq52, Hq8 }
 
 impl Mlp {
-    fn dtype(self, del_perfil: &'static str) -> &'static str {
-        match self { Mlp::DelPerfil => del_perfil, Mlp::Hq52 => "hq52k", Mlp::Hq8 => "hq8k" }
+    fn dtype(self, from_profile: &'static str) -> &'static str {
+        match self { Mlp::FromProfile => from_profile, Mlp::Hq52 => "hq52k", Mlp::Hq8 => "hq8k" }
     }
 }
 
@@ -54,15 +54,15 @@ pub struct Options<'a> {
     pub out: &'a Path,
     pub profile: Profile,
     pub ple: Ple,
-    pub embedding: Escalon,
-    pub atencion: Escalon,
+    pub embedding: Level,
+    pub attention: Level,
     pub mlp: Mlp,
     pub mlp_down: Mlp,
     pub vision: bool,
     pub commit: &'a str,
     /// Directorio con la importancia por columna de los `mlp.down`, como el del v9.1
     /// (`data/hqs_v4/importance-down-e4b`). Sin él, el HQ44 va con importancia 1.
-    pub importancia: Option<&'a Path>,
+    pub importance: Option<&'a Path>,
 }
 
 const TENSOR_ALIGN: u64 = 4096;
@@ -86,24 +86,24 @@ fn storage(o: &Options, canonical: &str, hint: QuantHint, shape: &[usize]) -> &'
     let matrix = shape.len() >= 2 && shape.last().map_or(false, |&c| c % 256 == 0);
     let embedding = canonical == "text.token_embedding.weight";
     if !matrix || (hint == QuantHint::FP16 && !embedding) { return "fp16"; }
-    let tabla_ple = canonical == "text.ple.token_embedding.weight";
-    let large = canonical.contains(".mlp.") || tabla_ple;
-    let del_perfil = if o.profile == Profile::Compacto && large { crate::hqs::v4::DTYPE } else { "hq8k" };
-    if tabla_ple {
-        return match o.ple { Ple::DelPerfil => del_perfil, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" };
+    let ple_table = canonical == "text.ple.token_embedding.weight";
+    let large = canonical.contains(".mlp.") || ple_table;
+    let from_profile = if o.profile == Profile::Compacto && large { crate::hqs::v4::DTYPE } else { "hq8k" };
+    if ple_table {
+        return match o.ple { Ple::FromProfile => from_profile, Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" };
     }
     if canonical.contains(".mlp.") {
         let down = canonical.ends_with(".mlp.down.weight");
-        return if down { o.mlp_down.dtype(del_perfil) } else { o.mlp.dtype(del_perfil) };
+        return if down { o.mlp_down.dtype(from_profile) } else { o.mlp.dtype(from_profile) };
     }
     if embedding { return o.embedding.dtype(); }
-    if canonical.contains(".attn.") { return o.atencion.dtype(); }
-    del_perfil
+    if canonical.contains(".attn.") { return o.attention.dtype(); }
+    from_profile
 }
 
 /// Importancia por columna de `<dir>/<canónico>.f32`, la convención del v9.1: solo la tienen
 /// los `mlp.down`, un f32 por columna de entrada. Vacía para todo lo demás.
-fn importancia(dir: Option<&Path>, canonical: &str, cols: usize) -> Result<Vec<f32>> {
+fn importance(dir: Option<&Path>, canonical: &str, cols: usize) -> Result<Vec<f32>> {
     let Some(dir) = dir else { return Ok(Vec::new()) };
     if !canonical.ends_with(".mlp.down.weight") { return Ok(Vec::new()); }
     let path = dir.join(format!("{canonical}.f32"));
@@ -211,7 +211,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
             let info = reader.tensor_info(&t.source).unwrap();
             let raw = reader.read_raw(&t.source)?;
             let mut hashing = Hashing { inner: &mut *w, state: xxhash_rust::xxh3::Xxh3::new(), written: 0 };
-            let imp = importancia(o.importancia, &t.canonical, *t.shape.last().context("forma vacía")?)?;
+            let imp = importance(o.importance, &t.canonical, *t.shape.last().context("forma vacía")?)?;
             emit(&mut hashing, t, raw, &info.dtype, &imp)?;
             ensure!(hashing.written == t.bytes, "{}: {} bytes escritos, {} previstos", t.canonical, hashing.written, t.bytes);
             hashes.push((hashing.state.digest128().to_le_bytes(), xxhash_rust::xxh3::xxh3_64(raw)));
@@ -255,15 +255,15 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
 
     let mut params = vec![
         Property { key: "profile".into(), value: Value::Str(match o.profile { Profile::Q8 => "q8", Profile::Compacto => "compacto" }.into()) },
-        Property { key: "ple".into(), value: Value::Str(match o.ple { Ple::DelPerfil => "del perfil", Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }.into()) },
+        Property { key: "ple".into(), value: Value::Str(match o.ple { Ple::FromProfile => "from profile", Ple::Hq52 => "hq52k", Ple::Hq8 => "hq8k" }.into()) },
         Property { key: "embedding".into(), value: Value::Str(o.embedding.dtype().into()) },
-        Property { key: "atencion".into(), value: Value::Str(o.atencion.dtype().into()) },
-        Property { key: "mlp".into(), value: Value::Str(o.mlp.dtype("del perfil").into()) },
-        Property { key: "mlp_down".into(), value: Value::Str(o.mlp_down.dtype("del perfil").into()) },
+        Property { key: "attention".into(), value: Value::Str(o.attention.dtype().into()) },
+        Property { key: "mlp".into(), value: Value::Str(o.mlp.dtype("from profile").into()) },
+        Property { key: "mlp_down".into(), value: Value::Str(o.mlp_down.dtype("from profile").into()) },
         Property { key: "base_id".into(), value: Value::Str(base_id) },
         Property { key: "source_model".into(), value: Value::Str(o.model.display().to_string()) },
         // La ruta completa, no el nombre: `convert --como` la necesita para rehacer la variante.
-        Property { key: "calibration".into(), value: Value::Str(match o.importancia {
+        Property { key: "calibration".into(), value: Value::Str(match o.importance {
             Some(d) => d.display().to_string(), None => "none".into() }) },
     ];
     if let Some(w) = &written {
