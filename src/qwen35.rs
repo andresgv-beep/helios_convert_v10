@@ -29,9 +29,12 @@
 //! Los datos propios de la familia viajan como propiedades de la configuración (`layer_types`,
 //! `linear_*`, `attn_output_gate`): la configuración binaria no los tiene y no se toca.
 //!
-//! De momento un solo perfil, `fp16`: todo tal como viene, sin cuantizar. Es el que hace falta
-//! para comparar el motor con la referencia sin el ruido de la cuantización. Se dejan fuera la
-//! torre visual (`model.visual.*`) y el módulo de predicción múltiple (`mtp.*`).
+//! Por defecto todo va en FP16, tal como viene: es lo que hace falta para comparar el motor con
+//! la referencia sin el ruido de la cuantización. Con `Levels` se elige el escalón de cada grupo
+//! de matrices por separado (embedding, cabeza, atención, capa lineal, MLP y expertos), para
+//! poder medir qué aguanta cada uno. Normas, vectores, la convolución, las puertas `lin.a` y
+//! `lin.b`, el enrutador y la puerta del experto compartido se quedan siempre en FP16. Se dejan
+//! fuera la torre visual (`model.visual.*`) y el módulo de predicción múltiple (`mtp.*`).
 use crate::file::{open, verify_tensors, Builder};
 use crate::format::align_up;
 use crate::hints::binary::build_execution_hints_binary;
@@ -47,7 +50,79 @@ pub struct Options<'a> {
     pub model: &'a Path,
     pub out: &'a Path,
     pub commit: &'a str,
+    pub levels: Levels,
 }
+
+/// El escalón de cada grupo de matrices. Los nombres son los dtype del HNF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Levels {
+    pub emb: &'static str, pub head: &'static str, pub attn: &'static str,
+    pub lin: &'static str, pub mlp: &'static str, pub experts: &'static str,
+}
+
+impl Levels {
+    pub fn fp16() -> Self { Levels { emb: "fp16", head: "fp16", attn: "fp16", lin: "fp16", mlp: "fp16", experts: "fp16" } }
+
+    /// `grupo=escalón` separados por comas, sobre una base en FP16. Grupos: `emb`, `head`,
+    /// `attn`, `lin`, `mlp`, `experts` y `todo`. Escalones: `fp16`, `hq8k`, `hq52`, `hq44`.
+    /// Los expertos solo admiten `fp16` o `hq44`, que es lo que lee el MoE del motor.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let mut levels = Levels::fp16();
+        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (group, level) = part.split_once('=').with_context(|| format!("«{part}»: se espera grupo=escalón"))?;
+            let level = match level {
+                "fp16" => "fp16", "hq8k" | "hq8" => "hq8k", "hq52k" | "hq52" => "hq52k",
+                "hq44" | "hq44k" => crate::hqs::v4::DTYPE,
+                other => bail!("escalón desconocido: {other} (fp16, hq8k, hq52 o hq44)"),
+            };
+            match group {
+                "emb" => levels.emb = level, "head" => levels.head = level, "attn" => levels.attn = level,
+                "lin" => levels.lin = level, "mlp" => levels.mlp = level, "experts" => levels.experts = level,
+                "todo" => {
+                    levels = Levels { emb: level, head: level, attn: level, lin: level, mlp: level, experts: levels.experts };
+                }
+                other => bail!("grupo desconocido: {other} (emb, head, attn, lin, mlp, experts o todo)"),
+            }
+        }
+        ensure!(levels.experts == "fp16" || levels.experts == crate::hqs::v4::DTYPE,
+            "los expertos solo van en fp16 o hq44: el MoE del motor no lee otro escalón");
+        Ok(levels)
+    }
+
+    pub fn describe(&self) -> String {
+        format!("emb={},head={},attn={},lin={},mlp={},experts={}", self.emb, self.head, self.attn, self.lin, self.mlp, self.experts)
+    }
+
+    /// El escalón de un tensor por su nombre canónico (sin el prefijo `text.`).
+    fn of(&self, canonical: &str, shape: &[usize]) -> Result<&'static str> {
+        let part = canonical.rsplit_once('.').map_or(canonical, |(head, _)| head);
+        let part = part.split_once('.').filter(|(first, _)| first.starts_with("layer")).map_or(part, |(_, rest)| rest);
+        let level = match part {
+            "token_embedding" => self.emb,
+            "lm_head" => self.head,
+            "attn.q_proj" | "attn.k_proj" | "attn.v_proj" | "attn.o_proj" => self.attn,
+            "lin.qkv" | "lin.z" | "lin.out" => self.lin,
+            "mlp.gate" | "mlp.up" | "mlp.down" => self.mlp,
+            "moe.experts.gate_up" | "moe.experts.down" => self.experts,
+            _ => "fp16",
+        };
+        ensure!(level == "fp16" || (shape.len() >= 2 && shape.last().map_or(false, |&c| c % 256 == 0)),
+            "{canonical}: {level} pide filas de un múltiplo de 256 columnas y tiene {:?}", shape);
+        Ok(level)
+    }
+}
+
+fn stored_bytes(dtype: &str, elements: u64) -> u64 {
+    match dtype {
+        "hq8k" => crate::hqs::hq8k_size(elements as usize) as u64,
+        "hq52k" => crate::hqs::hq52k_size(elements as usize) as u64,
+        "hq44k_g16" => elements / 256 * 152,
+        _ => elements * 2,
+    }
+}
+
+/// Filas por tanda al cuantizar: acota la RAM con el embedding y con los expertos.
+const ROWS_PER_BATCH: usize = 1024;
 
 const TENSOR_ALIGN: u64 = 4096;
 
@@ -139,7 +214,7 @@ fn source_f32(raw: &[u8], dtype: &str, i: usize) -> f32 {
     }
 }
 
-struct Planned { canonical: String, source: String, layer: i32, shape: Vec<usize>, change: Change, bytes: u64 }
+struct Planned { canonical: String, source: String, layer: i32, shape: Vec<usize>, change: Change, dtype: &'static str, bytes: u64 }
 
 /// Escribe el tensor en FP16. Devuelve cuántos valores no caben exactos en FP16, para dejarlo
 /// dicho en la procedencia: BF16 tiene más exponente y menos mantisa que FP16.
@@ -147,6 +222,22 @@ fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<u64> 
     let elements: usize = t.shape.iter().product();
     let width = if dtype == "F32" { 4 } else { 2 };
     ensure!(raw.len() == elements * width, "{}: bytes de origen que no cuadran", t.canonical);
+    if t.dtype != "fp16" {
+        ensure!(t.change == Change::None, "{}: una norma no se cuantiza", t.canonical);
+        let row = *t.shape.last().context("forma vacía")?;
+        let batch = row * ROWS_PER_BATCH;
+        for start in (0..elements).step_by(batch) {
+            let values: Vec<f32> = (start..elements.min(start + batch)).map(|i| source_f32(raw, dtype, i)).collect();
+            ensure!(values.iter().all(|v| v.is_finite()), "{}: valores no finitos", t.canonical);
+            match t.dtype {
+                "hq8k" => w.write_all(&crate::hqs::quantize_hq8k(&values))?,
+                "hq52k" => w.write_all(&crate::hqs::quantize_hq52k(&values))?,
+                // Sin calibrar: importancia 1 en todas las columnas.
+                _ => w.write_all(&crate::hqs::v4::quantize(&values, row, &[])?)?,
+            }
+        }
+        return Ok(0);
+    }
     let mut inexact = 0u64;
     let mut bytes = Vec::with_capacity(elements.min(1 << 20) * 2);
     for i in 0..elements {
@@ -226,8 +317,9 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
             vec![info.shape[0], info.shape[2]]
         } else { info.shape.clone() };
         let elements: u64 = shape.iter().map(|&d| d as u64).product();
+        let dtype = o.levels.of(&m.canonical, &shape)?;
         plan.push(Planned { canonical: format!("text.{}", m.canonical), source: name.to_string(), layer: m.layer,
-            shape, change: if m.plus_one { Change::PlusOne } else { Change::None }, bytes: elements * 2 });
+            shape, change: if m.plus_one { Change::PlusOne } else { Change::None }, dtype, bytes: stored_bytes(dtype, elements) });
     }
     plan.sort_by(|a, b| (a.layer, &a.canonical).cmp(&(b.layer, &b.canonical)));
     let expected = expected_tensors(&letters, moe, tied);
@@ -279,7 +371,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     let mut md = Metadata::default();
     let mut weight_bytes = 0;
     for (i, t) in plan.iter().enumerate() {
-        md.tensors.push(Tensor { name: t.canonical.clone(), component: 1, layer: t.layer, dtype: "fp16".into(),
+        md.tensors.push(Tensor { name: t.canonical.clone(), component: 1, layer: t.layer, dtype: t.dtype.into(),
             shape: t.shape.iter().map(|&d| d as u64).collect(), logical_last: *t.shape.last().unwrap() as u64,
             offset: text_at + layout[i], size: t.bytes,
             experts: if t.canonical.contains(".moe.experts.") { u32::try_from(t.shape[0])? } else { 0 }, hash: hashes[i].0,
@@ -322,7 +414,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         version: env!("CARGO_PKG_VERSION").into(), commit: o.commit.into(), input: [0; 16], output: identity,
         calibration: String::new(), touched: vec![], params: vec![
             Property { key: "family".into(), value: Value::Str("qwen3_5".into()) },
-            Property { key: "profile".into(), value: Value::Str("fp16".into()) },
+            Property { key: "profile".into(), value: Value::Str(o.levels.describe()) },
             Property { key: "norms".into(), value: Value::Str("stored as 1 + weight".into()) },
             Property { key: "fp16_inexact_values".into(), value: Value::Int(inexact as i64) },
             Property { key: "base_id".into(), value: Value::Str(base_id) },
@@ -390,6 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn each_group_takes_its_own_level_and_small_tensors_stay_in_fp16() {
+        let levels = Levels::parse("todo=hq8k,mlp=hq44,experts=hq44,head=hq52").unwrap();
+        let of = |name: &str, shape: &[usize]| levels.of(name, shape).unwrap();
+        assert_eq!(of("token_embedding.weight", &[1000, 1024]), "hq8k");
+        assert_eq!(of("lm_head.weight", &[1000, 1024]), "hq52k");
+        assert_eq!(of("layer3.attn.q_proj.weight", &[4096, 1024]), "hq8k");
+        assert_eq!(of("layer0.lin.qkv.weight", &[6144, 1024]), "hq8k");
+        assert_eq!(of("layer0.mlp.down.weight", &[1024, 3584]), crate::hqs::v4::DTYPE);
+        assert_eq!(of("layer0.moe.experts.down.weight", &[256, 2048, 512]), crate::hqs::v4::DTYPE);
+        for name in ["layer0.lin.a.weight", "layer0.lin.b.weight", "layer0.lin.conv.weight", "layer0.lin.a_log",
+            "layer0.lin.norm.weight", "layer0.moe.router.weight", "layer0.moe.shared_gate.weight", "final_norm.weight"] {
+            assert_eq!(of(name, &[16, 1024]), "fp16", "{name}");
+        }
+        assert_eq!(Levels::parse("").unwrap(), Levels::fp16());
+        // «todo» no arrastra a los expertos: solo admiten fp16 o hq44.
+        assert_eq!(Levels::parse("todo=hq8k").unwrap().experts, "fp16");
+        assert!(Levels::parse("experts=hq8k").is_err());
+        assert!(Levels::parse("mlp=q4").is_err() && Levels::parse("cosa=hq8k").is_err());
+        assert!(levels.of("layer0.mlp.down.weight", &[1024, 1000]).is_err());
+    }
+
+    #[test]
     fn layer_types_and_the_tensor_count() {
         let text = json!({"layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"]});
         let letters = layer_letters(&text).unwrap();
@@ -401,7 +515,7 @@ mod tests {
 
     #[test]
     fn plus_one_is_applied_when_writing_and_inexact_values_are_counted() {
-        let t = Planned { canonical: "text.final_norm.weight".into(), source: String::new(), layer: -1, shape: vec![2],
+        let t = Planned { canonical: "text.final_norm.weight".into(), source: String::new(), layer: -1, shape: vec![2], dtype: "fp16",
             change: Change::PlusOne, bytes: 4 };
         let raw: Vec<u8> = [0.5f32, -0.25].iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut out = Vec::new();

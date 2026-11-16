@@ -58,6 +58,10 @@ enum Command {
         /// Importancia HQ44: por experto en el MoE (layerN.gate_up.f32 y layerN.down.f32), y por
         /// columna de cada mlp.down en el denso (text.layerN.mlp.down.weight.f32).
         #[arg(long)] importance: Option<PathBuf>,
+        /// Qwen3.5: escalón por grupo de matrices, `grupo=escalón` separados por comas. Grupos
+        /// emb, head, attn, lin, mlp, experts y todo; escalones fp16, hq8k, hq52 y hq44. Sin
+        /// esto, todo en FP16. Ejemplo: `todo=hq8k,mlp=hq44,experts=hq44`.
+        #[arg(long)] escalones: Option<String>,
         #[arg(long, default_value = "")] commit: String,
         #[arg(long, default_value_t = 10)] threads: usize,
     },
@@ -126,19 +130,24 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Convert { model, out, vision, compacto, ple, embedding, attention, mlp, mlp_down, like, dense_hq8, importance, commit, threads } => {
+        Command::Convert { model, out, vision, compacto, ple, embedding, attention, mlp, mlp_down, like, dense_hq8, importance, escalones, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["model_type"] == "qwen3_5" || config["model_type"] == "qwen3_5_moe" {
-                // La familia Qwen3.5 densa: de momento solo en FP16, sin cuantizar.
+                // La familia Qwen3.5: sus escalones van por --escalones, no por las opciones de Gemma.
                 anyhow::ensure!(!vision && !compacto && !dense_hq8 && ple.is_none() && embedding.is_none() && attention.is_none()
                     && mlp.is_none() && mlp_down.is_none() && like.is_none() && importance.is_none(),
-                    "Qwen3.5 se convierte de momento solo en FP16: ninguna opción de formato aplica");
+                    "Qwen3.5 elige formato con --escalones: las opciones de Gemma no aplican");
+                let levels = match &escalones {
+                    Some(spec) => helios_convert_v10::qwen35::Levels::parse(spec)?,
+                    None => helios_convert_v10::qwen35::Levels::fp16(),
+                };
                 let identity = helios_convert_v10::qwen35::convert(&helios_convert_v10::qwen35::Options {
-                    model: &model, out: &out, commit: &commit })?;
+                    model: &model, out: &out, commit: &commit, levels })?;
                 println!("{} convertido: identidad {}", out.display(), identity.iter().map(|b| format!("{b:02x}")).collect::<String>());
                 return Ok(());
             }
+            anyhow::ensure!(escalones.is_none(), "--escalones es de la familia Qwen3.5");
             if config["text_config"]["enable_moe_block"] != true {
                 anyhow::ensure!(!dense_hq8, "--dense-hq8 es del MoE; el denso ya va en HQ8K");
                 // La receta de otro fichero, si se pide. Los flags explicitos pisan lo que diga.
