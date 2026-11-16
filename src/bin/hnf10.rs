@@ -129,7 +129,7 @@ fn main() -> Result<()> {
         Command::Convert { model, out, vision, compacto, ple, embedding, attention, mlp, mlp_down, like, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
-            if config["model_type"] == "qwen3_5" {
+            if config["model_type"] == "qwen3_5" || config["model_type"] == "qwen3_5_moe" {
                 // La familia Qwen3.5 densa: de momento solo en FP16, sin cuantizar.
                 anyhow::ensure!(!vision && !compacto && !dense_hq8 && ple.is_none() && embedding.is_none() && attention.is_none()
                     && mlp.is_none() && mlp_down.is_none() && like.is_none() && importance.is_none(),

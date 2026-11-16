@@ -59,8 +59,10 @@ pub struct Mapped { pub canonical: String, pub layer: i32, pub plus_one: bool }
 
 /// Nombre canónico de un tensor del checkpoint, o `None` si no es del modelo de texto.
 pub fn map_tensor(name: &str) -> Option<Mapped> {
-    let rest = name.strip_prefix("model.language_model.")?;
     let global = |canonical: &str, plus_one| Some(Mapped { canonical: canonical.into(), layer: -1, plus_one });
+    // La cabeza propia, en los modelos que no la comparten con el embedding.
+    if name == "lm_head.weight" { return global("lm_head.weight", false); }
+    let rest = name.strip_prefix("model.language_model.")?;
     match rest {
         "embed_tokens.weight" => return global("token_embedding.weight", false),
         "norm.weight" => return global("final_norm.weight", true),
@@ -75,6 +77,15 @@ pub fn map_tensor(name: &str) -> Option<Mapped> {
         "mlp.gate_proj.weight" => ("mlp.gate.weight", false),
         "mlp.up_proj.weight" => ("mlp.up.weight", false),
         "mlp.down_proj.weight" => ("mlp.down.weight", false),
+        // MoE. El experto compartido es una MLP densa y ocupa los nombres de la MLP; ojo,
+        // que en el checkpoint `mlp.gate` es el enrutador y no la puerta de una MLP.
+        "mlp.gate.weight" => ("moe.router.weight", false),
+        "mlp.experts.gate_up_proj" => ("moe.experts.gate_up.weight", false),
+        "mlp.experts.down_proj" => ("moe.experts.down.weight", false),
+        "mlp.shared_expert.gate_proj.weight" => ("mlp.gate.weight", false),
+        "mlp.shared_expert.up_proj.weight" => ("mlp.up.weight", false),
+        "mlp.shared_expert.down_proj.weight" => ("mlp.down.weight", false),
+        "mlp.shared_expert_gate.weight" => ("moe.shared_gate.weight", false),
         "self_attn.q_proj.weight" => ("attn.q_proj.weight", false),
         "self_attn.k_proj.weight" => ("attn.k_proj.weight", false),
         "self_attn.v_proj.weight" => ("attn.v_proj.weight", false),
@@ -98,7 +109,7 @@ pub fn map_tensor(name: &str) -> Option<Mapped> {
 /// Tensores que se dejan fuera a propósito. Cualquier otro sin nombre canónico es un error:
 /// mejor parar que convertir un modelo al que le falta una pieza.
 fn skipped(name: &str) -> bool {
-    name.starts_with("model.visual.") || name.starts_with("mtp.") || name == "lm_head.weight"
+    name.starts_with("model.visual.") || name.starts_with("mtp.")
 }
 
 /// Los tipos de capa en una letra cada uno: `l` lineal (DeltaNet), `a` atención.
@@ -112,9 +123,12 @@ pub fn layer_letters(text: &serde_json::Value) -> Result<String> {
 }
 
 /// Cuántos tensores de texto tiene que haber: 14 por capa lineal, 11 por capa de atención,
-/// más el embedding y la norma final.
-pub fn expected_tensors(letters: &str) -> usize {
-    2 + letters.chars().map(|c| if c == 'l' { 14 } else { 11 }).sum::<usize>()
+/// más el embedding y la norma final. Con MoE cada capa cambia su MLP de 3 tensores por 7
+/// (enrutador, dos de expertos, tres del experto compartido y su puerta). La cabeza cuenta
+/// si no se comparte con el embedding.
+pub fn expected_tensors(letters: &str, moe: bool, tied: bool) -> usize {
+    let per_layer_extra = if moe { 4 } else { 0 };
+    2 + usize::from(!tied) + letters.chars().map(|c| (if c == 'l' { 14 } else { 11 }) + per_layer_extra).sum::<usize>()
 }
 
 fn source_f32(raw: &[u8], dtype: &str, i: usize) -> f32 {
@@ -165,7 +179,9 @@ fn text_hints(text: &serde_json::Value, vocab: usize) -> Result<serde_json::Valu
     Ok(json!({
         "arch": "qwen2", "dtype": "fp16",
         "num_hidden_layers": field("num_hidden_layers")?, "hidden_size": field("hidden_size")?,
-        "intermediate_size": field("intermediate_size")?, "vocab_size": vocab,
+        // En un MoE la MLP densa de la capa es el experto compartido.
+        "intermediate_size": field(if text["num_experts"].is_null() { "intermediate_size" } else { "shared_expert_intermediate_size" })?,
+        "vocab_size": vocab,
         "num_attention_heads": field("num_attention_heads")?, "num_key_value_heads": field("num_key_value_heads")?,
         "head_dim": field("head_dim")?, "attention_type": "gqa", "attention_bias": false,
         "qkv_layout": "separate", "use_qk_norm": true, "parallel_attention": false, "kv_layout": "BHSD",
@@ -187,17 +203,18 @@ fn text_hints(text: &serde_json::Value, vocab: usize) -> Result<serde_json::Valu
 pub fn convert(o: &Options) -> Result<[u8; 16]> {
     ensure!(!o.out.exists(), "{} ya existe", o.out.display());
     let root: serde_json::Value = serde_json::from_slice(&std::fs::read(o.model.join("config.json"))?)?;
-    ensure!(root["model_type"] == "qwen3_5", "requiere un checkpoint Qwen3.5 denso (model_type qwen3_5)");
+    ensure!(root["model_type"] == "qwen3_5" || root["model_type"] == "qwen3_5_moe",
+        "requiere un checkpoint de la familia Qwen3.5 (model_type qwen3_5 o qwen3_5_moe)");
     let text = &root["text_config"];
-    ensure!(text["num_experts"].is_null(), "es un MoE: esta conversión solo cubre los densos");
-    ensure!(text["tie_word_embeddings"].as_bool().unwrap_or(false),
-        "embeddings y cabeza sin compartir: falta decidir el formato de lm_head para este tamaño");
+    let moe = !text["num_experts"].is_null();
+    let tied = text["tie_word_embeddings"].as_bool().unwrap_or(false);
     let letters = layer_letters(text)?;
     ensure!(letters.len() as u64 == text["num_hidden_layers"].as_u64().unwrap_or(0), "layer_types no cuadra con num_hidden_layers");
     let reader = SafetensorReader::from_folder(o.model)?;
 
     let mut plan = Vec::new();
     for (name, info) in reader.iter_tensors() {
+        if tied && name == "lm_head.weight" { continue; }
         let Some(m) = map_tensor(name) else {
             ensure!(skipped(name), "{name}: tensor que esta conversión no conoce");
             continue;
@@ -213,11 +230,14 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
             shape, change: if m.plus_one { Change::PlusOne } else { Change::None }, bytes: elements * 2 });
     }
     plan.sort_by(|a, b| (a.layer, &a.canonical).cmp(&(b.layer, &b.canonical)));
-    ensure!(plan.len() == expected_tensors(&letters), "{} tensores de texto y se esperaban {}", plan.len(), expected_tensors(&letters));
+    let expected = expected_tensors(&letters, moe, tied);
+    ensure!(plan.len() == expected, "{} tensores de texto y se esperaban {expected}", plan.len());
     for (i, letter) in letters.chars().enumerate() {
         let has = |suffix: &str| plan.iter().any(|t| t.canonical == format!("text.layer{i}.{suffix}"));
         let ok = if letter == 'l' { has("lin.qkv.weight") && !has("attn.q_proj.weight") } else { has("attn.q_proj.weight") && !has("lin.qkv.weight") };
         ensure!(ok, "la capa {i} no trae los tensores de su tipo ({letter})");
+        ensure!(has("moe.router.weight") == moe && has("moe.experts.gate_up.weight") == moe && has("mlp.down.weight"),
+            "la capa {i} no trae la MLP que dice la configuración");
     }
 
     let embedding = plan.iter().find(|t| t.canonical == "text.token_embedding.weight").context("falta el embedding")?;
@@ -261,7 +281,8 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     for (i, t) in plan.iter().enumerate() {
         md.tensors.push(Tensor { name: t.canonical.clone(), component: 1, layer: t.layer, dtype: "fp16".into(),
             shape: t.shape.iter().map(|&d| d as u64).collect(), logical_last: *t.shape.last().unwrap() as u64,
-            offset: text_at + layout[i], size: t.bytes, experts: 0, hash: hashes[i].0,
+            offset: text_at + layout[i], size: t.bytes,
+            experts: if t.canonical.contains(".moe.experts.") { u32::try_from(t.shape[0])? } else { 0 }, hash: hashes[i].0,
             source: t.source.clone(), source_hash: hashes[i].1 });
         weight_bytes += t.bytes;
     }
@@ -277,7 +298,7 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     }
     // Lo que distingue a la familia y la configuración binaria no trae.
     let integer = |key: &str| -> Result<Value> { Ok(Value::Int(text[key].as_i64().with_context(|| format!("falta {key}"))?)) };
-    for (key, value) in [
+    let mut properties = vec![
         ("layer_types", Value::Str(letters.clone())),
         ("linear_num_key_heads", integer("linear_num_key_heads")?),
         ("linear_num_value_heads", integer("linear_num_value_heads")?),
@@ -285,7 +306,13 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         ("linear_value_head_dim", integer("linear_value_head_dim")?),
         ("linear_conv_kernel", integer("linear_conv_kernel_dim")?),
         ("attn_output_gate", Value::Bool(text["attn_output_gate"].as_bool().unwrap_or(false))),
-    ] {
+    ];
+    if moe {
+        properties.push(("moe_experts", integer("num_experts")?));
+        properties.push(("moe_top_k", integer("num_experts_per_tok")?));
+        properties.push(("moe_intermediate", integer("moe_intermediate_size")?));
+    }
+    for (key, value) in properties {
         md.properties.push((3, Property { key: key.into(), value }));
     }
     for i in 0..md.components.len() { md.components[i].composite = md.composite(&md.components[i]); }
@@ -351,11 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn the_moe_router_is_not_mistaken_for_a_dense_gate() {
+        let at = |part: &str| map_tensor(&format!("model.language_model.layers.2.mlp.{part}")).unwrap().canonical;
+        assert_eq!(at("gate.weight"), "layer2.moe.router.weight");
+        assert_eq!(at("gate_proj.weight"), "layer2.mlp.gate.weight");
+        assert_eq!(at("shared_expert.gate_proj.weight"), "layer2.mlp.gate.weight");
+        assert_eq!(at("shared_expert_gate.weight"), "layer2.moe.shared_gate.weight");
+        assert_eq!(at("experts.gate_up_proj"), "layer2.moe.experts.gate_up.weight");
+        assert_eq!(at("experts.down_proj"), "layer2.moe.experts.down.weight");
+        assert_eq!(map_tensor("lm_head.weight").unwrap().canonical, "lm_head.weight");
+    }
+
+    #[test]
     fn layer_types_and_the_tensor_count() {
         let text = json!({"layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"]});
         let letters = layer_letters(&text).unwrap();
         assert_eq!(letters, "llla");
-        assert_eq!(expected_tensors(&letters), 2 + 3 * 14 + 11);
+        assert_eq!(expected_tensors(&letters, false, true), 2 + 3 * 14 + 11);
+        assert_eq!(expected_tensors(&letters, true, false), 3 + 3 * 18 + 15);
         assert!(layer_letters(&json!({"layer_types": ["sliding_attention"]})).is_err());
     }
 
