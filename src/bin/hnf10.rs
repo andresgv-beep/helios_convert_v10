@@ -129,6 +129,16 @@ fn main() -> Result<()> {
         Command::Convert { model, out, vision, compacto, ple, embedding, attention, mlp, mlp_down, like, dense_hq8, importance, commit, threads } => {
             rayon_threads(threads)?;
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
+            if config["model_type"] == "qwen3_5" {
+                // La familia Qwen3.5 densa: de momento solo en FP16, sin cuantizar.
+                anyhow::ensure!(!vision && !compacto && !dense_hq8 && ple.is_none() && embedding.is_none() && attention.is_none()
+                    && mlp.is_none() && mlp_down.is_none() && like.is_none() && importance.is_none(),
+                    "Qwen3.5 se convierte de momento solo en FP16: ninguna opción de formato aplica");
+                let identity = helios_convert_v10::qwen35::convert(&helios_convert_v10::qwen35::Options {
+                    model: &model, out: &out, commit: &commit })?;
+                println!("{} convertido: identidad {}", out.display(), identity.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                return Ok(());
+            }
             if config["text_config"]["enable_moe_block"] != true {
                 anyhow::ensure!(!dense_hq8, "--dense-hq8 es del MoE; el denso ya va en HQ8K");
                 // La receta de otro fichero, si se pide. Los flags explicitos pisan lo que diga.

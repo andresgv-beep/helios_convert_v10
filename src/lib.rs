@@ -11,6 +11,7 @@ pub mod convert;
 pub mod fixtures;
 pub mod vision;
 pub mod gemma4_dense;
+pub mod qwen35;
 
 // Traídos de helios_convert_v9.1 en 79835e4 (rama gemma4-26b-moe): codificadores HQS, mapeo
 // de modelos, safetensors, tokenizer HTF3, configuración binaria y plan de Gemma 4 MoE. Desde
