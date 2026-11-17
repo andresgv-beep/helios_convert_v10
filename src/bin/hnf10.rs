@@ -135,7 +135,7 @@ fn main() -> Result<()> {
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?;
             if config["model_type"] == "qwen3_5" || config["model_type"] == "qwen3_5_moe" {
                 // La familia Qwen3.5: sus escalones van por --escalones, no por las opciones de Gemma.
-                anyhow::ensure!(!vision && !compacto && !dense_hq8 && ple.is_none() && embedding.is_none() && attention.is_none()
+                anyhow::ensure!(!compacto && !dense_hq8 && ple.is_none() && embedding.is_none() && attention.is_none()
                     && mlp.is_none() && mlp_down.is_none() && like.is_none() && importance.is_none(),
                     "Qwen3.5 elige formato con --escalones: las opciones de Gemma no aplican");
                 let levels = match &escalones {
@@ -143,7 +143,7 @@ fn main() -> Result<()> {
                     None => helios_convert_v10::qwen35::Levels::fp16(),
                 };
                 let identity = helios_convert_v10::qwen35::convert(&helios_convert_v10::qwen35::Options {
-                    model: &model, out: &out, commit: &commit, levels })?;
+                    model: &model, out: &out, commit: &commit, levels, vision })?;
                 println!("{} convertido: identidad {}", out.display(), identity.iter().map(|b| format!("{b:02x}")).collect::<String>());
                 return Ok(());
             }

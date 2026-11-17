@@ -52,6 +52,8 @@ pub struct Options<'a> {
     pub out: &'a Path,
     pub commit: &'a str,
     pub levels: Levels,
+    /// Añade la torre visual como componente opcional, en FP16 y sin cuantizar.
+    pub vision: bool,
 }
 
 /// El escalón de cada grupo de matrices. Los nombres son los dtype del HNF.
@@ -180,6 +182,40 @@ pub fn map_tensor(name: &str) -> Option<Mapped> {
         _ => return None,
     };
     Some(Mapped { canonical: format!("layer{layer}.{canonical}"), layer, plus_one })
+}
+
+/// Nombre canónico de un tensor de la torre visual (`model.visual.*`), con su capa.
+///
+/// | checkpoint | canónico | |
+/// |---|---|---|
+/// | `patch_embed.proj` `[W, 3, 2, 16, 16]` | `vision.patch_embed` `[W, 1536]` | la convolución 3D, como lineal |
+/// | `pos_embed.weight` | `vision.pos_embed.weight` | rejilla aprendida de 48×48 |
+/// | `blocks.N.norm1`, `norm2` | `vision.layerN.ln1`, `ln2` | con sesgo |
+/// | `blocks.N.attn.qkv`, `attn.proj` | `vision.layerN.attn.qkv`, `attn.proj` | con sesgo |
+/// | `blocks.N.mlp.linear_fc1`, `linear_fc2` | `vision.layerN.mlp.fc1`, `fc2` | |
+/// | `merger.norm`, `linear_fc1`, `linear_fc2` | `vision.merger.norm`, `fc1`, `fc2` | la fusión 2×2 |
+pub fn map_vision(name: &str) -> Option<(String, i32)> {
+    let rest = name.strip_prefix("model.visual.")?;
+    let (rest, kind) = rest.rsplit_once('.')?;
+    if kind != "weight" && kind != "bias" { return None; }
+    let (canonical, layer) = match rest {
+        "patch_embed.proj" => ("patch_embed".to_string(), -1),
+        "pos_embed" if kind == "weight" => ("pos_embed".to_string(), -1),
+        "merger.norm" => ("merger.norm".to_string(), -1),
+        "merger.linear_fc1" => ("merger.fc1".to_string(), -1),
+        "merger.linear_fc2" => ("merger.fc2".to_string(), -1),
+        _ => {
+            let (index, part) = rest.strip_prefix("blocks.")?.split_once('.')?;
+            let layer: i32 = index.parse().ok()?;
+            let part = match part {
+                "norm1" => "ln1", "norm2" => "ln2", "attn.qkv" => "attn.qkv", "attn.proj" => "attn.proj",
+                "mlp.linear_fc1" => "mlp.fc1", "mlp.linear_fc2" => "mlp.fc2",
+                _ => return None,
+            };
+            (format!("layer{layer}.{part}"), layer)
+        }
+    };
+    Some((format!("vision.{canonical}.{kind}"), layer))
 }
 
 /// Tensores que se dejan fuera a propósito. Cualquier otro sin nombre canónico es un error:
@@ -371,6 +407,51 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         None => None,
     };
 
+    // La torre visual, si se pide: un payload aparte, todo en FP16. Son 0,9 GB en el 35B y
+    // el motor la deja en RAM, así que cuantizarla no ahorraría VRAM.
+    let mut vision_plan: Vec<Planned> = Vec::new();
+    let mut vision_layout = Vec::new();
+    let mut vision_hashes = Vec::new();
+    let mut vision_at = 0u64;
+    let mut vision_size = 0u64;
+    if o.vision {
+        let depth = root["vision_config"]["depth"].as_u64().context("falta vision_config.depth")? as usize;
+        for (name, info) in reader.iter_tensors() {
+            let Some((canonical, layer)) = map_vision(name) else {
+                ensure!(!name.starts_with("model.visual."), "{name}: tensor de visión que esta conversión no conoce");
+                continue;
+            };
+            ensure!(["BF16", "F16", "F32"].contains(&info.dtype.as_str()), "{name}: dtype {} no admitido", info.dtype);
+            // La convolución de parches [W, 3, 2, 16, 16] es una lineal sobre el parche aplanado.
+            let shape: Vec<usize> = if canonical == "vision.patch_embed.weight" {
+                vec![info.shape[0], info.shape[1..].iter().product()]
+            } else { info.shape.clone() };
+            let elements: u64 = shape.iter().map(|&d| d as u64).product();
+            vision_plan.push(Planned { canonical, source: name.to_string(), layer, shape, change: Change::None,
+                dtype: "fp16", bytes: elements * 2 });
+        }
+        vision_plan.sort_by(|a, b| (a.layer, &a.canonical).cmp(&(b.layer, &b.canonical)));
+        ensure!(vision_plan.len() == 9 + 12 * depth, "{} tensores de visión y se esperaban {}", vision_plan.len(), 9 + 12 * depth);
+        let mut end = 0u64;
+        for t in &vision_plan { let at = align_up(end, TENSOR_ALIGN); vision_layout.push(at); end = at + t.bytes; }
+        vision_size = end;
+        let (at, _) = builder.payload(vision_size, 4096, |w| {
+            let mut written = 0u64;
+            for (t, &at) in vision_plan.iter().zip(&vision_layout) {
+                w.write_all(&vec![0u8; (at - written) as usize])?;
+                let info = reader.tensor_info(&t.source).unwrap();
+                let raw = reader.read_raw(&t.source)?;
+                let mut hashing = Hashing { inner: &mut *w, state: xxhash_rust::xxh3::Xxh3::new(), written: 0 };
+                inexact += emit(&mut hashing, t, raw, &info.dtype)?;
+                ensure!(hashing.written == t.bytes, "{}: {} bytes escritos, {} previstos", t.canonical, hashing.written, t.bytes);
+                vision_hashes.push((hashing.state.digest128().to_le_bytes(), xxhash_rust::xxh3::xxh3_64(raw)));
+                written = at + t.bytes;
+            }
+            Ok(())
+        })?;
+        vision_at = at;
+    }
+
     let mut md = Metadata::default();
     let mut weight_bytes = 0;
     for (i, t) in plan.iter().enumerate() {
@@ -391,6 +472,19 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
     if let (Some((at, hash)), Some(bytes)) = (tpl, &template) {
         md.components.push(component(4, kind::TEMPLATE, false, "chat_template.jinja", at, bytes.len() as u64, n, 0, 0, hash));
     }
+    if o.vision {
+        let first = md.tensors.len() as u32;
+        for (i, t) in vision_plan.iter().enumerate() {
+            md.tensors.push(Tensor { name: t.canonical.clone(), component: 5, layer: t.layer, dtype: "fp16".into(),
+                shape: t.shape.iter().map(|&d| d as u64).collect(), logical_last: *t.shape.last().unwrap() as u64,
+                offset: vision_at + vision_layout[i], size: t.bytes, experts: 0, hash: vision_hashes[i].0,
+                source: t.source.clone(), source_hash: vision_hashes[i].1 });
+        }
+        md.components.push(Component { id: 5, kind: kind::VISION, required: false, name: "visión Qwen3.5".into(),
+            payload_offset: vision_at, payload_size: vision_size, alignment: 4096,
+            weight_bytes: vision_plan.iter().map(|t| t.bytes).sum(), memory: None, first_tensor: first,
+            tensor_count: vision_plan.len() as u32, depends_on: Some(1), composite: [0; 16], bytes_hash: [0; 16] });
+    }
     // Lo que distingue a la familia y la configuración binaria no trae.
     let integer = |key: &str| -> Result<Value> { Ok(Value::Int(text[key].as_i64().with_context(|| format!("falta {key}"))?)) };
     let mut properties = vec![
@@ -402,6 +496,24 @@ pub fn convert(o: &Options) -> Result<[u8; 16]> {
         ("linear_conv_kernel", integer("linear_conv_kernel_dim")?),
         ("attn_output_gate", Value::Bool(text["attn_output_gate"].as_bool().unwrap_or(false))),
     ];
+    if o.vision {
+        // La geometría de la torre y los tokens que marcan una imagen en el texto.
+        let vision = &root["vision_config"];
+        let of = |from: &serde_json::Value, key: &str| -> Result<Value> {
+            Ok(Value::Int(from[key].as_i64().with_context(|| format!("falta {key}"))?))
+        };
+        properties.push(("vision_family", Value::Str("qwen3_5".into())));
+        for (property, key) in [("vision_depth", "depth"), ("vision_hidden_size", "hidden_size"),
+            ("vision_num_heads", "num_heads"), ("vision_intermediate_size", "intermediate_size"),
+            ("vision_patch_size", "patch_size"), ("vision_spatial_merge_size", "spatial_merge_size"),
+            ("vision_temporal_patch_size", "temporal_patch_size"), ("vision_out_hidden_size", "out_hidden_size"),
+            ("vision_num_position_embeddings", "num_position_embeddings")] {
+            properties.push((property, of(vision, key)?));
+        }
+        for key in ["image_token_id", "vision_start_token_id", "vision_end_token_id"] {
+            properties.push((key, of(&root, key)?));
+        }
+    }
     if moe {
         properties.push(("moe_experts", integer("num_experts")?));
         properties.push(("moe_top_k", integer("num_experts_per_tok")?));
@@ -504,6 +616,22 @@ mod tests {
         assert!(Levels::parse("experts=hq8k").is_err());
         assert!(Levels::parse("mlp=q4").is_err() && Levels::parse("cosa=hq8k").is_err());
         assert!(levels.of("layer0.mlp.down.weight", &[1024, 1000]).is_err());
+    }
+
+    #[test]
+    fn vision_tensors_get_their_names_and_nothing_else_slips_in() {
+        let at = |name: &str| map_vision(&format!("model.visual.{name}"));
+        assert_eq!(at("patch_embed.proj.weight"), Some(("vision.patch_embed.weight".into(), -1)));
+        assert_eq!(at("patch_embed.proj.bias"), Some(("vision.patch_embed.bias".into(), -1)));
+        assert_eq!(at("pos_embed.weight"), Some(("vision.pos_embed.weight".into(), -1)));
+        assert_eq!(at("blocks.7.norm1.bias"), Some(("vision.layer7.ln1.bias".into(), 7)));
+        assert_eq!(at("blocks.7.attn.qkv.weight"), Some(("vision.layer7.attn.qkv.weight".into(), 7)));
+        assert_eq!(at("blocks.11.mlp.linear_fc2.weight"), Some(("vision.layer11.mlp.fc2.weight".into(), 11)));
+        assert_eq!(at("merger.linear_fc1.bias"), Some(("vision.merger.fc1.bias".into(), -1)));
+        assert_eq!(at("merger.norm.weight"), Some(("vision.merger.norm.weight".into(), -1)));
+        assert_eq!(at("blocks.0.algo.weight"), None);
+        assert_eq!(at("pos_embed.bias"), None);
+        assert_eq!(map_vision("model.language_model.norm.weight"), None);
     }
 
     #[test]
