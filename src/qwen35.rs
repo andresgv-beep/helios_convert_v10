@@ -42,6 +42,7 @@ use crate::metadata::{kind, step, Component, Metadata, Property, Step, Tensor, V
 use crate::SafetensorReader;
 use anyhow::{bail, ensure, Context, Result};
 use half::{bf16, f16};
+use rayon::prelude::*;
 use serde_json::json;
 use std::io::Write;
 use std::path::Path;
@@ -122,7 +123,7 @@ fn stored_bytes(dtype: &str, elements: u64) -> u64 {
 }
 
 /// Filas por tanda al cuantizar: acota la RAM con el embedding y con los expertos.
-const ROWS_PER_BATCH: usize = 1024;
+const ROWS_PER_BATCH: usize = 8192;
 
 const TENSOR_ALIGN: u64 = 4096;
 
@@ -227,8 +228,10 @@ fn emit(w: &mut dyn Write, t: &Planned, raw: &[u8], dtype: &str) -> Result<u64> 
         let row = *t.shape.last().context("forma vacía")?;
         let batch = row * ROWS_PER_BATCH;
         for start in (0..elements).step_by(batch) {
-            let values: Vec<f32> = (start..elements.min(start + batch)).map(|i| source_f32(raw, dtype, i)).collect();
-            ensure!(values.iter().all(|v| v.is_finite()), "{}: valores no finitos", t.canonical);
+            // Pasar a f32 en paralelo: hecho en serie era lo que frenaba la conversión del
+            // 35B, con los cuantizadores (que ya van en paralelo) esperando.
+            let values: Vec<f32> = (start..elements.min(start + batch)).into_par_iter().map(|i| source_f32(raw, dtype, i)).collect();
+            ensure!(values.par_iter().all(|v| v.is_finite()), "{}: valores no finitos", t.canonical);
             match t.dtype {
                 "hq8k" => w.write_all(&crate::hqs::quantize_hq8k(&values))?,
                 "hq52k" => w.write_all(&crate::hqs::quantize_hq52k(&values))?,
